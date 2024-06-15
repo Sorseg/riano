@@ -1,19 +1,22 @@
 use std::{
     collections::VecDeque,
     f32::consts::{PI, TAU},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicI32, Ordering},
+        Arc, Mutex,
+    },
 };
 
 use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
     BufferSize,
 };
-use eframe::egui::CentralPanel;
-use egui_plot::{Line, Plot, PlotPoints};
+use eframe::egui::{CentralPanel, Slider, Ui, Vec2b};
+use egui_plot::{Line, Plot, PlotBounds, PlotPoints};
 use midi_msg::{ChannelVoiceMsg, MidiMsg};
 use midir::MidiInput;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Note {
     note_n: u8,
     phase: f32,
@@ -21,9 +24,11 @@ struct Note {
     vel: f32,
     asdr: Asdr,
     on: bool,
+    /// 0.0 - left, 1.0 - right
+    pan: f32,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Asdr {
     attack_level: f32,
     release_level: f32,
@@ -55,8 +60,14 @@ impl Asdr {
         }
     }
 }
+const VIS_BUF_SECS: f32 = 4.0;
+const VIS_BUF_SIZE: usize = (44100.0 * VIS_BUF_SECS) as usize;
 
-const VIS_BUF_SIZE: usize = 44100 * 3;
+#[derive(Debug, Default)]
+struct Settings {
+    chorus_phase_offset: AtomicI32,
+    fat_detune: AtomicI32
+}
 
 fn main() {
     // FIXME: opt
@@ -66,6 +77,9 @@ fn main() {
 
     let vis_buf = Arc::new(Mutex::new(VecDeque::<f32>::new()));
     let buf2 = Arc::clone(&vis_buf);
+
+    let settings_writer = Arc::new(Settings::default());
+    let settings_reader = Arc::clone(&settings_writer);
 
     // MIDI
     let midi_in = MidiInput::new("riano").unwrap();
@@ -97,10 +111,27 @@ fn main() {
                         vel: velocity as f32 / 255.0,
                         phase: 0.0,
                         asdr: Asdr::new(0.01, 1.0),
+                        pan: 0.5,
                     };
-                    note_counter += 1;
-                    println!("{note_counter} {note:?}");
-                    notes.lock().unwrap().push(note)
+
+                    let fat_n = 4;
+
+                    for fat in 0..fat_n {
+                        // -0.5 .. 0.5
+                        let fat_offset = (fat as f32 - fat_n as f32 / 2.0) / fat_n as f32;
+                        let mut note = note.clone();
+                        note.freq *= 1.0 + fat as f32 * (settings_reader.fat_detune.load(Ordering::Relaxed) as f32 / 10000.0);
+                        note.pan = 0.5 + fat_offset * 0.2;
+                        note.vel *= (fat_n - fat) as f32 / fat_n as f32;
+                        note.phase = (fat as f32 / fat_n as f32)
+                            * (settings_reader.chorus_phase_offset.load(Ordering::Relaxed) as f32
+                                / 10000.0);
+
+                        note_counter += 1;
+                        println!("{note_counter} {note:?}");
+
+                        notes.lock().unwrap().push(note)
+                    }
                 }
                 if let MidiMsg::ChannelVoice {
                     msg: ChannelVoiceMsg::NoteOff { note, .. },
@@ -126,32 +157,40 @@ fn main() {
     config.buffer_size = BufferSize::Fixed(256);
     let sample_rate = config.sample_rate.0 as f32;
     let dt = 1.0 / sample_rate;
-    println!("{sample_rate:?}");
+    println!("{config:?}");
 
-    let volume = 0.9;
+    let volume = 0.8;
 
     let stream = dev
         .build_output_stream(
             &config,
             move |data: &mut [f32], _| {
-                for p in data.iter_mut() {
-                    *p = 0.0;
-                    let mut notes = notes2.lock().unwrap();
+                let mut notes = notes2.lock().unwrap();
+                let mut apply_notes = |d: &mut f32, pan_inv: bool| {
+                    *d = 0.0;
                     for n in notes.iter_mut() {
                         n.phase += n.freq * TAU * dt;
                         if n.phase > PI {
                             n.phase -= TAU;
                         }
-                        *p += n.phase.sin()
+                        *d += n.phase.sin().powf(5.0)
                             * n.vel
                             * volume
+                            * if pan_inv { 1.0 - n.pan } else { n.pan }
                             * if n.on {
                                 n.asdr.attack(dt)
                             } else {
                                 n.asdr.release(dt)
                             }
                     }
+                };
+                for c in data.chunks_exact_mut(2) {
+                    // left
+                    apply_notes(&mut c[0], true);
+                    // right
+                    apply_notes(&mut c[1], false)
                 }
+
                 let mut vis_buf = vis_buf.lock().unwrap();
                 vis_buf.extend(data.iter().copied());
                 if vis_buf.len() > VIS_BUF_SIZE * 2 {
@@ -167,25 +206,23 @@ fn main() {
     eframe::run_native(
         "Riano",
         eframe::NativeOptions::default(),
-        Box::new(|_cc| Box::new(App::new(buf2, notes3))),
+        Box::new(|_cc| {
+            Box::new(App {
+                vis_buf: buf2,
+                locked: vec![],
+                notes: notes3,
+                settings: settings_writer,
+            })
+        }),
     )
     .unwrap();
 }
 
 struct App {
-    buf: Arc<Mutex<VecDeque<f32>>>,
+    vis_buf: Arc<Mutex<VecDeque<f32>>>,
     locked: Vec<f32>,
     notes: Arc<Mutex<Vec<Note>>>,
-}
-
-impl App {
-    fn new(buf: Arc<Mutex<VecDeque<f32>>>, notes: Arc<Mutex<Vec<Note>>>) -> Self {
-        Self {
-            buf,
-            locked: vec![],
-            notes,
-        }
-    }
+    settings: Arc<Settings>,
 }
 
 impl eframe::App for App {
@@ -198,7 +235,7 @@ impl eframe::App for App {
                 .unwrap()
                 .retain_mut(|n| n.asdr.release(0.0) > 0.01)
         }
-        let mut buf = self.buf.lock().unwrap();
+        let mut buf = self.vis_buf.lock().unwrap();
         let to_remove = buf.len().saturating_sub(VIS_BUF_SIZE);
         for _ in 0..to_remove {
             buf.pop_front();
@@ -206,31 +243,56 @@ impl eframe::App for App {
 
         let step_by = 20;
         CentralPanel::default().show(ctx, |ui| {
-            if ui.button("lock").clicked() {
-                self.locked = buf.iter().copied().collect();
-            }
-            if ui.button("reset").clicked() {
-                self.locked.clear();
-            }
-            Plot::new("vaweform").show(ui, |ui| {
-                let live: PlotPoints = buf
-                    .iter()
-                    .enumerate()
-                    .map(|(i, s)| [i as f64 / 44100.0, *s as f64])
-                    .step_by(step_by)
-                    .collect();
+            let mut reset_zoom = false;
 
-                let locked: PlotPoints = self
-                    .locked
-                    .iter()
-                    .enumerate()
-                    .map(|(i, s)| [i as f64 / 44100.0, *s as f64])
-                    .step_by(step_by)
-                    .collect();
-
-                ui.line(Line::new(live));
-                ui.line(Line::new(locked).name("locked"));
+            ui.horizontal(|ui| {
+                if ui.button("lock").clicked() {
+                    self.locked = buf.iter().copied().collect();
+                }
+                if ui.button("reset").clicked() {
+                    self.locked.clear();
+                }
+                reset_zoom = ui.button("reset zoom").clicked();
             });
+
+            let slider = |ui: &mut Ui, atomic: &AtomicI32, range, text: &str|{
+                let mut val = atomic.load(Ordering::Relaxed);
+                let prev_value = val;
+                ui.add(Slider::new(&mut val, range).text(text));
+                if val != prev_value {
+                    atomic.store(val, Ordering::Relaxed);
+                }
+            };
+            slider(ui, &self.settings.chorus_phase_offset, -30000..=30000, "phase offset");
+            slider(ui, &self.settings.fat_detune, -10000..=10000, "detune");
+
+            Plot::new("waveform")
+                .auto_bounds(Vec2b { x: true, y: false })
+                .allow_double_click_reset(false)
+                .show(ui, |ui| {
+                    if reset_zoom {
+                        ui.set_plot_bounds(PlotBounds::from_min_max(
+                            [0.0, -1.0],
+                            [VIS_BUF_SECS as f64, 1.0],
+                        ))
+                    }
+                    let live: PlotPoints = buf
+                        .iter()
+                        .enumerate()
+                        .map(|(i, s)| [i as f64 / 44100.0, *s as f64])
+                        .step_by(step_by)
+                        .collect();
+
+                    let locked: PlotPoints = self
+                        .locked
+                        .iter()
+                        .enumerate()
+                        .map(|(i, s)| [i as f64 / 44100.0, *s as f64])
+                        .collect();
+
+                    ui.line(Line::new(live));
+                    ui.line(Line::new(locked).name("locked"));
+                });
         });
     }
 }
