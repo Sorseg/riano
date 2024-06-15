@@ -1,7 +1,6 @@
 use std::{
     array,
     collections::VecDeque,
-    f32::consts::TAU,
     sync::{
         atomic::{AtomicI32, Ordering},
         mpsc::channel,
@@ -14,28 +13,12 @@ use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
     BufferSize,
 };
-use derivative::Derivative;
+
 use eframe::egui::{CentralPanel, Slider, Ui, Vec2b};
 use egui_plot::{Line, Plot, PlotBounds, PlotPoints};
 use glam::Vec2;
 use midi_msg::{ChannelVoiceMsg, MidiMsg};
 use midir::MidiInput;
-
-#[derive(Clone, Derivative)]
-#[derivative(Debug)]
-struct Note {
-    note_n: u8,
-    // index in the samples array
-    phase: f32,
-    freq: f32,
-    vel: f32,
-    on: bool,
-    /// 0.0 - left, 1.0 - right
-    pan: f32,
-
-    #[derivative(Debug = "ignore")]
-    samples_at_20_hz: Arc<[f32; 44100 / 20]>,
-}
 
 const VIS_BUF_SECS: f32 = 4.0;
 const VIS_BUF_SIZE: usize = (44100.0 * VIS_BUF_SECS) as usize;
