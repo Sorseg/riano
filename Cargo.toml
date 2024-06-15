@@ -3,9 +3,17 @@ name = "riano"
 version = "0.1.0"
 edition = "2021"
 
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.dev]
+opt-level = 1
+
 [dependencies]
 cpal = "0.15.3"
 crossbeam = "0.8.4"
+eframe = "0.27.2"
+egui_plot = "0.27.2"
 midi-msg = "0.7.1"
 midir = "0.10.0"
 ringbuf = "0.4.1"
