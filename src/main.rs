@@ -1,6 +1,7 @@
 use std::{
+    array,
     collections::VecDeque,
-    f32::consts::{PI, TAU},
+    f32::consts::TAU,
     sync::{
         atomic::{AtomicI32, Ordering},
         Arc, Mutex,
@@ -11,14 +12,17 @@ use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
     BufferSize,
 };
+use derivative::Derivative;
 use eframe::egui::{CentralPanel, Slider, Ui, Vec2b};
 use egui_plot::{Line, Plot, PlotBounds, PlotPoints};
 use midi_msg::{ChannelVoiceMsg, MidiMsg};
 use midir::MidiInput;
 
-#[derive(Debug, Clone)]
+#[derive(Clone, Derivative)]
+#[derivative(Debug)]
 struct Note {
     note_n: u8,
+    // index in the samples array
     phase: f32,
     freq: f32,
     vel: f32,
@@ -26,6 +30,9 @@ struct Note {
     on: bool,
     /// 0.0 - left, 1.0 - right
     pan: f32,
+
+    #[derivative(Debug = "ignore")]
+    samples_at_20_hz: Arc<[f32; 44100 / 20]>,
 }
 
 #[derive(Debug, Clone)]
@@ -106,6 +113,9 @@ fn main() {
 
     println!("Connecting to {}", midi_in.port_name(casio).unwrap());
     let mut note_counter: u64 = 1;
+    let sin_pow_at_20_hz = Arc::new(array::from_fn(|i| {
+        (i as f32 * 20.0 / 44100.0 * TAU).sin().powf(3.0)
+    }));
     let _conn = midi_in
         .connect(
             casio,
@@ -127,6 +137,7 @@ fn main() {
                         phase: 0.0,
                         asdr: Asdr::new(0.01, 1.0),
                         pan: 0.5,
+                        samples_at_20_hz: Arc::clone(&sin_pow_at_20_hz),
                     };
 
                     let fat_n = settings_reader.fat_n.load(Ordering::Relaxed);
@@ -185,42 +196,51 @@ fn main() {
     let mut config: cpal::StreamConfig = dev.default_output_config().unwrap().into();
     config.buffer_size = BufferSize::Fixed(256);
     let sample_rate = config.sample_rate.0 as f32;
-    let dt = 1.0 / sample_rate;
     println!("{config:?}");
 
     let stream = dev
         .build_output_stream(
             &config,
             move |data: &mut [f32], _| {
-                let mut notes = notes2.lock().unwrap();
-                let mut apply_notes = |d: &mut f32, pan_inv: bool| {
+                fn apply_notes_to_single_sample(
+                    d: &mut f32,
+                    pan_mul: f32,
+                    pan_offset: f32,
+                    notes: &mut [Note],
+                    sample_rate: f32,
+                ) {
+                    let dt = 1.0 / sample_rate;
                     *d = 0.0;
                     for n in notes.iter_mut() {
-                        n.phase += n.freq * TAU * dt;
-                        if n.phase > PI {
-                            n.phase -= TAU;
+                        n.phase += n.freq / 20.0;
+                        if n.phase as usize > n.samples_at_20_hz.len() - 1 {
+                            n.phase -= n.samples_at_20_hz.len() as f32
                         }
-                        *d += n.phase.sin().powf(5.0)
-                            * n.vel
-                            * if pan_inv { 1.0 - n.pan } else { n.pan }
+                        let idx = n.phase as usize;
+                        let sample = n.samples_at_20_hz[idx] * n.vel;
+                        let panned = sample * (pan_offset + n.pan * pan_mul);
+                        let asdrd = panned
                             * if n.on {
                                 n.asdr.attack(dt)
                             } else {
                                 n.asdr.release(dt)
-                            }
+                            };
+
+                        *d += asdrd;
                     }
-                };
+                }
+                let mut notes = notes2.lock().unwrap();
                 for c in data.chunks_exact_mut(2) {
                     // left
-                    apply_notes(&mut c[0], true);
+                    apply_notes_to_single_sample(&mut c[0], -1.0, 1.0, &mut notes, sample_rate);
                     // right
-                    apply_notes(&mut c[1], false)
+                    apply_notes_to_single_sample(&mut c[1], 1.0, 0.0, &mut notes, sample_rate)
                 }
 
                 let mut vis_buf = vis_buf.lock().unwrap();
                 vis_buf.extend(data.iter().copied());
                 if vis_buf.len() > VIS_BUF_SIZE * 2 {
-                    panic!("buf not consumed");
+                    panic!("visual buf not being consumed");
                 }
             },
             |err| eprintln!("{err:?}"),

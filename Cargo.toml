@@ -16,6 +16,7 @@ debug = true
 [dependencies]
 cpal = "0.15.3"
 crossbeam = "0.8.4"
+derivative = "2.2.0"
 eframe = "0.27.2"
 egui_plot = "0.27.2"
 midi-msg = "0.7.1"
