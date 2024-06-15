@@ -200,8 +200,11 @@ impl eframe::App for App {
         }
         let mut buf = self.buf.lock().unwrap();
         let to_remove = buf.len().saturating_sub(VIS_BUF_SIZE);
-        let mut remainder = buf.split_off(to_remove);
-        std::mem::swap(&mut remainder, &mut buf);
+        for _ in 0..to_remove {
+            buf.pop_front();
+        }
+
+        let step_by = 20;
         CentralPanel::default().show(ctx, |ui| {
             if ui.button("lock").clicked() {
                 self.locked = buf.iter().copied().collect();
@@ -214,7 +217,7 @@ impl eframe::App for App {
                     .iter()
                     .enumerate()
                     .map(|(i, s)| [i as f64 / 44100.0, *s as f64])
-                    .step_by(10)
+                    .step_by(step_by)
                     .collect();
 
                 let locked: PlotPoints = self
@@ -222,7 +225,7 @@ impl eframe::App for App {
                     .iter()
                     .enumerate()
                     .map(|(i, s)| [i as f64 / 44100.0, *s as f64])
-                    .step_by(10)
+                    .step_by(step_by)
                     .collect();
 
                 ui.line(Line::new(live));
