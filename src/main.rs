@@ -80,7 +80,13 @@ impl<const N: usize> PianoString<N> {
         }
     }
     fn pluck(&mut self, vel: f32) {
-        self.pos[20].y = vel.clamp(0.0, 10.0);
+        let vel = vel.clamp(0.0, 1.0);
+        for i in 0..N / 4 {
+            self.vel[i].y = (i as f32 / N as f32 / 4.0) * vel;
+        }
+        for i in N / 4..N {
+            self.vel[i].y = (N as f32 - i as f32) / N as f32 * vel;
+        }
         self.is_active = true;
     }
     fn tick(&mut self) {
@@ -95,7 +101,6 @@ impl<const N: usize> PianoString<N> {
         // apply velocity
         for i in 1..(self.pos.len() - 1) {
             self.pos[i] += self.vel[i] / self.inertia;
-            
 
             if self.pos[i].y.abs() > active_thresh {
                 is_active = true;
@@ -182,7 +187,7 @@ fn main() {
     println!("{config:?}");
 
     let mut strings: [PianoString<64>; 128] =
-        array::from_fn(|i| PianoString::new(i as f32 / 10.0 - 5.0, 100.0 - i as f32 / 2.0));
+        array::from_fn(|i| PianoString::new(i as f32 / 10.0 - 5.0, 30.0 - i as f32 / 2.0));
     let mut start = Instant::now();
 
     let stream = dev
@@ -191,14 +196,13 @@ fn main() {
             move |data: &mut [f32], _| {
                 while let Ok((string_n, vel)) = impulse_receiver.try_recv() {
                     let string = &mut strings[string_n as usize];
-                    string.pluck(vel as f32 / 255.0 * 3.0);
+                    string.pluck(vel as f32 / 255.0);
                     println!(
                         "playing  string {} tension {} inertia {}",
-                        string_n,
-                        string.tension, string.inertia
+                        string_n, string.tension, string.inertia
                     );
                 }
-                let amplification = 4.0;
+                let amplification = 0.2;
 
                 for c in data.chunks_exact_mut(2) {
                     for s in &mut strings {
@@ -212,14 +216,14 @@ fn main() {
                     c[0] = strings
                         .iter()
                         .filter(|s| s.is_active)
-                        .map(|s| s.pos[40].y)
+                        .map(|s| s.pos[20].y)
                         .sum::<f32>()
                         * amplification;
                     // right
                     c[1] = strings
                         .iter()
                         .filter(|s| s.is_active)
-                        .map(|s| s.pos[41].y)
+                        .map(|s| s.pos[22].y)
                         .sum::<f32>()
                         * amplification;
                 }
