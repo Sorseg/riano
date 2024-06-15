@@ -203,6 +203,7 @@ fn main() {
         .unwrap();
     stream.play().unwrap();
 
+    // VISUALS
     eframe::run_native(
         "Riano",
         eframe::NativeOptions::default(),
