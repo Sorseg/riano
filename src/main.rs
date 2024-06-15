@@ -63,10 +63,25 @@ impl Asdr {
 const VIS_BUF_SECS: f32 = 4.0;
 const VIS_BUF_SIZE: usize = (44100.0 * VIS_BUF_SECS) as usize;
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Settings {
-    chorus_phase_offset: AtomicI32,
-    fat_detune: AtomicI32
+    fat_phase_offset: AtomicI32,
+    fat_detune: AtomicI32,
+    fat_n: AtomicI32,
+    fat_pan: AtomicI32,
+    boost: AtomicI32,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            fat_phase_offset: Default::default(),
+            fat_detune: Default::default(),
+            fat_n: 1.into(),
+            fat_pan: 6000.into(),
+            boost: Default::default(),
+        }
+    }
 }
 
 fn main() {
@@ -114,18 +129,32 @@ fn main() {
                         pan: 0.5,
                     };
 
-                    let fat_n = 4;
+                    let fat_n = settings_reader.fat_n.load(Ordering::Relaxed);
 
                     for fat in 0..fat_n {
-                        // -0.5 .. 0.5
-                        let fat_offset = (fat as f32 - fat_n as f32 / 2.0) / fat_n as f32;
+                        // 0.0 .. 1.0
+                        let fat_id = if fat_n == 1 {
+                            0.5
+                        } else {
+                            fat as f32 / (fat_n - 1) as f32
+                        };
+
                         let mut note = note.clone();
-                        note.freq *= 1.0 + fat as f32 * (settings_reader.fat_detune.load(Ordering::Relaxed) as f32 / 10000.0);
-                        note.pan = 0.5 + fat_offset * 0.2;
-                        note.vel *= (fat_n - fat) as f32 / fat_n as f32;
-                        note.phase = (fat as f32 / fat_n as f32)
-                            * (settings_reader.chorus_phase_offset.load(Ordering::Relaxed) as f32
-                                / 10000.0);
+                        note.freq *= 1.0
+                            + fat as f32
+                                * (settings_reader.fat_detune.load(Ordering::Relaxed) as f32
+                                    / 10000.0);
+                        note.pan = 0.5
+                            + (fat_id - 0.5)
+                                * settings_reader.fat_pan.load(Ordering::Relaxed) as f32
+                                / 10000.0;
+                        note.vel *= (1.0
+                            + settings_reader.boost.load(Ordering::Relaxed) as f32 / 10000.0)
+                            / fat_n as f32;
+                        note.phase = fat_id
+                            * (settings_reader.fat_phase_offset.load(Ordering::Relaxed) as f32
+                                / 10000.0)
+                            * TAU;
 
                         note_counter += 1;
                         println!("{note_counter} {note:?}");
@@ -159,8 +188,6 @@ fn main() {
     let dt = 1.0 / sample_rate;
     println!("{config:?}");
 
-    let volume = 0.8;
-
     let stream = dev
         .build_output_stream(
             &config,
@@ -175,7 +202,6 @@ fn main() {
                         }
                         *d += n.phase.sin().powf(5.0)
                             * n.vel
-                            * volume
                             * if pan_inv { 1.0 - n.pan } else { n.pan }
                             * if n.on {
                                 n.asdr.attack(dt)
@@ -256,7 +282,7 @@ impl eframe::App for App {
                 reset_zoom = ui.button("reset zoom").clicked();
             });
 
-            let slider = |ui: &mut Ui, atomic: &AtomicI32, range, text: &str|{
+            let slider = |ui: &mut Ui, atomic: &AtomicI32, range, text: &str| {
                 let mut val = atomic.load(Ordering::Relaxed);
                 let prev_value = val;
                 ui.add(Slider::new(&mut val, range).text(text));
@@ -264,8 +290,16 @@ impl eframe::App for App {
                     atomic.store(val, Ordering::Relaxed);
                 }
             };
-            slider(ui, &self.settings.chorus_phase_offset, -30000..=30000, "phase offset");
+            slider(
+                ui,
+                &self.settings.fat_phase_offset,
+                -30000..=30000,
+                "phase offset",
+            );
             slider(ui, &self.settings.fat_detune, -10000..=10000, "detune");
+            slider(ui, &self.settings.fat_n, 1..=100, "chorun N");
+            slider(ui, &self.settings.fat_pan, -10000..=10000, "chorun pan");
+            slider(ui, &self.settings.boost, 0..=100000, "boost");
 
             Plot::new("waveform")
                 .auto_bounds(Vec2b { x: true, y: false })
