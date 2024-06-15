@@ -9,6 +9,10 @@ opt-level = 3
 [profile.dev]
 opt-level = 1
 
+[profile.prof]
+inherits = "release"
+debug = true
+
 [dependencies]
 cpal = "0.15.3"
 crossbeam = "0.8.4"

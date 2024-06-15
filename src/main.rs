@@ -56,7 +56,7 @@ impl Asdr {
     }
 }
 
-const VIS_BUF_SIZE: usize = 44100 * 5;
+const VIS_BUF_SIZE: usize = 44100 * 3;
 
 fn main() {
     // FIXME: opt
@@ -64,8 +64,8 @@ fn main() {
     let notes2 = Arc::clone(&notes);
     let notes3 = Arc::clone(&notes);
 
-    let buf = Arc::new(Mutex::new(VecDeque::<f32>::new()));
-    let buf2 = Arc::clone(&buf);
+    let vis_buf = Arc::new(Mutex::new(VecDeque::<f32>::new()));
+    let buf2 = Arc::clone(&vis_buf);
 
     // MIDI
     let midi_in = MidiInput::new("riano").unwrap();
@@ -123,10 +123,12 @@ fn main() {
     let host = cpal::default_host();
     let dev = host.default_output_device().unwrap();
     let mut config: cpal::StreamConfig = dev.default_output_config().unwrap().into();
-    config.buffer_size = BufferSize::Fixed(512);
+    config.buffer_size = BufferSize::Fixed(256);
     let sample_rate = config.sample_rate.0 as f32;
     let dt = 1.0 / sample_rate;
     println!("{sample_rate:?}");
+
+    let volume = 0.9;
 
     let stream = dev
         .build_output_stream(
@@ -142,6 +144,7 @@ fn main() {
                         }
                         *p += n.phase.sin()
                             * n.vel
+                            * volume
                             * if n.on {
                                 n.asdr.attack(dt)
                             } else {
@@ -149,9 +152,9 @@ fn main() {
                             }
                     }
                 }
-                let mut buf = buf.lock().unwrap();
-                buf.extend(data.iter().copied());
-                if buf.len() > VIS_BUF_SIZE * 2 {
+                let mut vis_buf = vis_buf.lock().unwrap();
+                vis_buf.extend(data.iter().copied());
+                if vis_buf.len() > VIS_BUF_SIZE * 2 {
                     panic!("buf not consumed");
                 }
             },
@@ -203,11 +206,15 @@ impl eframe::App for App {
             if ui.button("lock").clicked() {
                 self.locked = buf.iter().copied().collect();
             }
+            if ui.button("reset").clicked() {
+                self.locked.clear();
+            }
             Plot::new("vaweform").show(ui, |ui| {
                 let live: PlotPoints = buf
                     .iter()
                     .enumerate()
                     .map(|(i, s)| [i as f64 / 44100.0, *s as f64])
+                    .step_by(10)
                     .collect();
 
                 let locked: PlotPoints = self
@@ -215,6 +222,7 @@ impl eframe::App for App {
                     .iter()
                     .enumerate()
                     .map(|(i, s)| [i as f64 / 44100.0, *s as f64])
+                    .step_by(10)
                     .collect();
 
                 ui.line(Line::new(live));
