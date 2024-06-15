@@ -1,0 +1,11 @@
+[package]
+name = "riano"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+cpal = "0.15.3"
+crossbeam = "0.8.4"
+midi-msg = "0.7.1"
+midir = "0.10.0"
+ringbuf = "0.4.1"
