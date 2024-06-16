@@ -1,10 +1,9 @@
 use std::{
     array,
     collections::VecDeque,
-    f32::consts::PI,
+    f32::consts::FRAC_PI_2,
     sync::{
-        atomic::{AtomicI32, Ordering},
-        mpsc::channel,
+        mpsc::{channel, Sender},
         Arc, Mutex,
     },
     time::Instant,
@@ -15,7 +14,7 @@ use cpal::{
     BufferSize,
 };
 
-use eframe::egui::{CentralPanel, Slider, Ui, Vec2b};
+use eframe::egui::{self, CentralPanel, Slider, Vec2b};
 use egui_plot::{Line, Plot, PlotBounds, PlotPoints};
 use glam::Vec2;
 use midi_msg::{ChannelVoiceMsg, MidiMsg};
@@ -24,24 +23,32 @@ use midir::MidiInput;
 const VIS_BUF_SECS: f32 = 4.0;
 const VIS_BUF_SIZE: usize = (44100.0 * VIS_BUF_SECS) as usize;
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Clone)]
 struct Settings {
-    fat_phase_offset: AtomicI32,
-    fat_detune: AtomicI32,
-    fat_n: AtomicI32,
-    fat_pan: AtomicI32,
-    boost: AtomicI32,
+    boost: f32,
+    inertia: [f32; 2],
+    tension: [f32; 2],
+    elasticity: [f32; 2],
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            fat_phase_offset: Default::default(),
-            fat_detune: Default::default(),
-            fat_n: 1.into(),
-            fat_pan: 6000.into(),
-            boost: Default::default(),
+            boost: 1.0,
+            inertia: [12.0, 1.0],
+            tension: [1.0, 5.0],
+            elasticity: [0.1, 0.001],
         }
+    }
+}
+
+trait Lerp {
+    fn lerp(&self, percent: f32) -> f32;
+}
+
+impl Lerp for [f32; 2] {
+    fn lerp(&self, percent: f32) -> f32 {
+        self[0] + (self[1] - self[0]) * percent
     }
 }
 
@@ -49,10 +56,14 @@ struct PianoString<const N: usize> {
     is_active: bool,
     tension: f32,
     inertia: f32,
+    elasticity: f32,
     // x,y
     pos: [Vec2; N],
     vel: [Vec2; N],
 }
+
+const STRING_POINTS: usize = 16;
+
 impl<const N: usize> PianoString<N> {
     /// tension should be less than inertia doubled
     fn new(tension: f32, inertia: f32) -> Self {
@@ -63,19 +74,24 @@ impl<const N: usize> PianoString<N> {
             is_active: false,
             tension,
             inertia,
+            elasticity: 0.001,
             pos: array::from_fn(|i| Vec2::new(i as f32, 0.0)),
             vel: array::from_fn(|_| Vec2::new(0.0, 0.0)),
         }
     }
     fn pluck(&mut self, vel: f32) {
         let vel = vel.clamp(0.0, 1.0);
-        let place_to_pluck = 20.clamp(0, N);
-        let pluck_width = 9.clamp(0, N);
+        let place_to_pluck = 6.clamp(0, N);
+        let pluck_width = 3.clamp(0, N);
         for i in (place_to_pluck - pluck_width)..=(place_to_pluck + pluck_width) {
             let distance_from_place_to_pluck = i as f32 - place_to_pluck as f32;
-            self.vel[i].y = (distance_from_place_to_pluck / pluck_width as f32 * PI).cos() * vel;
+            self.vel[i].y =
+                (distance_from_place_to_pluck / pluck_width as f32 * FRAC_PI_2).cos() * vel;
         }
         self.is_active = true;
+    }
+    fn listen(&self) -> f32 {
+        self.pos[4].y
     }
 
     fn tick(&mut self) {
@@ -112,9 +128,7 @@ impl<const N: usize> PianoString<N> {
         }
 
         // apply tension and elasticity
-        let elasticity = 0.01;
         for i in 2..(self.pos.len() - 2) {
-
             let straight_from_left = self.pos[i - 1] - self.pos[i - 2];
             let left_force_target = self.pos[i - 1] + straight_from_left * 2.0;
 
@@ -127,7 +141,7 @@ impl<const N: usize> PianoString<N> {
             let tension_force = tension_force_target - self.pos[i];
             let elastic_force = elastic_force_target - self.pos[i];
 
-            self.vel[i] += tension_force * self.tension + elastic_force * elasticity;
+            self.vel[i] += tension_force * self.tension + elastic_force * self.elasticity;
             self.vel[i] *= 1.0 - damping;
 
             if self.vel[i].y.abs() > active_thresh {
@@ -139,8 +153,6 @@ impl<const N: usize> PianoString<N> {
     }
 }
 
-const STRING_POINTS: usize = 64;
-
 fn main() {
     let (pluck_sender, pluck_receiver) = channel();
 
@@ -151,8 +163,7 @@ fn main() {
     let strings_snapshots_reader = Arc::clone(&strings_snapshots_writer);
     let strings_snapshot_refresh_ms = 10;
 
-    let settings_writer = Arc::new(Settings::default());
-    let settings_reader = Arc::clone(&settings_writer);
+    let (settings_sender, settings_reader) = channel::<Settings>();
 
     // MIDI
     let midi_in = MidiInput::new("riano").unwrap();
@@ -179,7 +190,7 @@ fn main() {
                 }
 
                 if let MidiMsg::ChannelVoice {
-                    msg: ChannelVoiceMsg::NoteOff { note, .. },
+                    msg: ChannelVoiceMsg::NoteOff { .. },
                     ..
                 } = m
                 {}
@@ -196,8 +207,11 @@ fn main() {
     println!("{config:?}");
 
     let mut strings: [PianoString<STRING_POINTS>; 128] =
-        array::from_fn(|i| PianoString::new(i as f32 / 100.0, 10.0));
+        array::from_fn(|_| PianoString::new(1.0, 10.0));
+
     let mut start = Instant::now();
+
+    let mut boost = 1.0;
 
     let stream = dev
         .build_output_stream(
@@ -207,16 +221,25 @@ fn main() {
                     let string = &mut strings[string_n as usize];
                     string.pluck(vel as f32 / 255.0);
                     println!(
-                        "playing  string {} tension {} inertia {}",
-                        string_n, string.tension, string.inertia
+                        "playing string {} tension {} inertia {} elasticity {}",
+                        string_n, string.tension, string.inertia, string.elasticity
                     );
                 }
-                let amplification = 0.8;
+                if let Ok(setting) = settings_reader.try_recv() {
+                    boost = setting.boost;
+
+                    let denominator = (strings.len() - 1) as f32;
+                    for (i, string) in strings.iter_mut().enumerate() {
+                        let percent = i as f32 / denominator;
+                        string.inertia = setting.inertia.lerp(percent);
+                        string.tension = setting.tension.lerp(percent);
+                        string.elasticity = setting.elasticity.lerp(percent);
+                    }
+                }
 
                 for c in data.chunks_exact_mut(2) {
-                    for s in &mut strings {
-                        s.tick();
-                    }
+                    strings.iter_mut().for_each(PianoString::tick);
+
                     if start.elapsed().as_millis() >= strings_snapshot_refresh_ms {
                         start = Instant::now();
                         // takes ~5 us for 10 strings
@@ -231,16 +254,16 @@ fn main() {
                     c[0] = strings
                         .iter()
                         .filter(|s| s.is_active)
-                        .map(|s| s.pos[20].y)
+                        .map(|s| s.listen())
                         .sum::<f32>()
-                        * amplification;
+                        * boost;
                     // right
                     c[1] = strings
                         .iter()
                         .filter(|s| s.is_active)
-                        .map(|s| s.pos[22].y)
+                        .map(|s| s.listen())
                         .sum::<f32>()
-                        * amplification;
+                        * boost;
                 }
 
                 let mut vis_buf = vis_buf.lock().unwrap();
@@ -258,12 +281,18 @@ fn main() {
     // VISUALS
     eframe::run_native(
         "Riano",
-        eframe::NativeOptions::default(),
+        eframe::NativeOptions {
+            viewport: eframe::egui::ViewportBuilder::default().with_inner_size([800.0, 500.0]),
+            ..Default::default()
+        },
         Box::new(|_cc| {
+            settings_sender.send(Settings::default()).unwrap();
+
             Box::new(App {
                 vis_buf: buf2,
                 locked: vec![],
-                settings: settings_writer,
+                settings_sender,
+                settings: Settings::default(),
                 strings_snapshots_reader,
             })
         }),
@@ -274,7 +303,8 @@ fn main() {
 struct App {
     vis_buf: Arc<Mutex<VecDeque<f32>>>,
     locked: Vec<f32>,
-    settings: Arc<Settings>,
+    settings_sender: Sender<Settings>,
+    settings: Settings,
     strings_snapshots_reader: Arc<Mutex<Vec<Vec<Vec2>>>>,
 }
 
@@ -301,24 +331,39 @@ impl eframe::App for App {
                 reset_zoom = ui.button("reset zoom").clicked();
             });
 
-            let slider = |ui: &mut Ui, atomic: &AtomicI32, range, text: &str| {
-                let mut val = atomic.load(Ordering::Relaxed);
-                let prev_value = val;
-                ui.add(Slider::new(&mut val, range).text(text));
-                if val != prev_value {
-                    atomic.store(val, Ordering::Relaxed);
+            let prev_setting = self.settings.clone();
+            let width = ui.available_width() * 0.8;
+            let size = egui::Vec2::new(width, 5.0);
+            ui.style_mut().spacing.slider_width = 300.0;
+            ui.add_sized(
+                size,
+                Slider::new(&mut self.settings.boost, 0.1..=5.0).text("boost"),
+            );
+            ui.group(|ui| {
+                for (val, name) in [
+                    (&mut self.settings.inertia, "inertia"),
+                    (&mut self.settings.tension, "tension"),
+                    (&mut self.settings.elasticity, "elasticity"),
+                ] {
+                    ui.add_sized(
+                        size,
+                        Slider::new(&mut val[0], 0.001..=100.0)
+                            .logarithmic(true)
+                            .text(format!("lowest {name}")),
+                    );
+                    ui.add_sized(
+                        size,
+                        Slider::new(&mut val[1], 0.001..=100.0)
+                            .logarithmic(true)
+                            .text(format!("highest {name}")),
+                    );
+                    ui.separator();
                 }
-            };
-            // slider(
-            //     ui,
-            //     &self.settings.fat_phase_offset,
-            //     -30000..=30000,
-            //     "phase offset",
-            // );
-            // slider(ui, &self.settings.fat_detune, -10000..=10000, "detune");
-            // slider(ui, &self.settings.fat_n, 1..=100, "chorun N");
-            // slider(ui, &self.settings.fat_pan, -10000..=10000, "chorun pan");
-            // slider(ui, &self.settings.boost, 0..=100000, "boost");
+            });
+
+            if prev_setting != self.settings {
+                self.settings_sender.send(self.settings.clone()).unwrap();
+            }
 
             Plot::new("waveform")
                 .auto_bounds(Vec2b { x: true, y: false })
@@ -380,7 +425,7 @@ impl eframe::App for App {
                         let line = Line::new(
                             string
                                 .iter()
-                                .map(|p| [p.x as f64, p.y as f64])
+                                .map(|p| [p.x as f64, p.y as f64 * self.settings.boost as f64])
                                 .collect::<PlotPoints>(),
                         )
                         .name(&format!("string {i}"));
