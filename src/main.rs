@@ -29,6 +29,7 @@ struct Settings {
     inertia: [f32; 2],
     tension: [f32; 2],
     elasticity: [f32; 2],
+    string_length: [u32; 2],
 }
 
 impl Default for Settings {
@@ -38,6 +39,7 @@ impl Default for Settings {
             inertia: [12.0, 1.0],
             tension: [1.0, 5.0],
             elasticity: [0.1, 0.001],
+            string_length: [128, 32],
         }
     }
 }
@@ -52,37 +54,38 @@ impl Lerp for [f32; 2] {
     }
 }
 
-struct PianoString<const N: usize> {
+impl Lerp for [u32; 2] {
+    fn lerp(&self, percent: f32) -> f32 {
+        self[0] as f32 + (self[1] as f32 - self[0] as f32) * percent
+    }
+}
+
+struct PianoString {
     is_active: bool,
     tension: f32,
     inertia: f32,
     elasticity: f32,
     // x,y
-    pos: [Vec2; N],
-    vel: [Vec2; N],
+    pos: Vec<Vec2>,
+    vel: Vec<Vec2>,
 }
 
-const STRING_POINTS: usize = 16;
-
-impl<const N: usize> PianoString<N> {
+impl PianoString {
     /// tension should be less than inertia doubled
-    fn new(tension: f32, inertia: f32) -> Self {
-        let inertia = inertia.clamp(0.1, 1000.0);
-        let tension = tension.clamp(0.01, inertia * 1.99);
-
+    fn new() -> Self {
         Self {
             is_active: false,
-            tension,
-            inertia,
+            tension: 1.0,
+            inertia: 5.0,
             elasticity: 0.001,
-            pos: array::from_fn(|i| Vec2::new(i as f32, 0.0)),
-            vel: array::from_fn(|_| Vec2::new(0.0, 0.0)),
+            pos: vec![],
+            vel: vec![],
         }
     }
     fn pluck(&mut self, vel: f32) {
         let vel = vel.clamp(0.0, 1.0);
-        let place_to_pluck = 6.clamp(0, N);
-        let pluck_width = 3.clamp(0, N);
+        let place_to_pluck = (self.pos.len() as f32 * 0.3) as usize;
+        let pluck_width = (self.pos.len() as f32 * 0.1) as usize;
         for i in (place_to_pluck - pluck_width)..=(place_to_pluck + pluck_width) {
             let distance_from_place_to_pluck = i as f32 - place_to_pluck as f32;
             self.vel[i].y =
@@ -90,8 +93,24 @@ impl<const N: usize> PianoString<N> {
         }
         self.is_active = true;
     }
+
     fn listen(&self) -> f32 {
         self.pos[4].y
+    }
+    /// needs to be called bo
+    fn resize(&mut self, new_size: usize) {
+        assert!(new_size > 4);
+        self.pos.truncate(new_size);
+        self.vel.truncate(new_size);
+        while self.pos.len() < new_size {
+            self.pos.push(Vec2::new(self.pos.len() as f32, 0.0));
+            self.vel.push(Vec2::ZERO);
+        }
+
+        // make sure the string is still attached horizontaly
+        let last = self.pos.len() - 1;
+        self.pos[last].y = 0.0;
+        self.pos[last - 1].y = 0.0;
     }
 
     fn tick(&mut self) {
@@ -206,8 +225,7 @@ fn main() {
     config.buffer_size = BufferSize::Fixed(256);
     println!("{config:?}");
 
-    let mut strings: [PianoString<STRING_POINTS>; 128] =
-        array::from_fn(|_| PianoString::new(1.0, 10.0));
+    let mut strings: [PianoString; 128] = array::from_fn(|_| PianoString::new());
 
     let mut start = Instant::now();
 
@@ -234,6 +252,8 @@ fn main() {
                         string.inertia = setting.inertia.lerp(percent);
                         string.tension = setting.tension.lerp(percent);
                         string.elasticity = setting.elasticity.lerp(percent);
+                        let new_size = setting.string_length.lerp(percent) as usize;
+                        string.resize(new_size);
                     }
                 }
 
@@ -347,18 +367,26 @@ impl eframe::App for App {
                 ] {
                     ui.add_sized(
                         size,
-                        Slider::new(&mut val[0], 0.001..=100.0)
+                        Slider::new(&mut val[0], 0.00001..=100.0)
                             .logarithmic(true)
                             .text(format!("lowest {name}")),
                     );
                     ui.add_sized(
                         size,
-                        Slider::new(&mut val[1], 0.001..=100.0)
+                        Slider::new(&mut val[1], 0.00001..=100.0)
                             .logarithmic(true)
                             .text(format!("highest {name}")),
                     );
                     ui.separator();
                 }
+                ui.add(
+                    Slider::new(&mut self.settings.string_length[0], 32..=256)
+                        .text("highest length"),
+                );
+                ui.add(
+                    Slider::new(&mut self.settings.string_length[1], 32..=256)
+                        .text("lowest length"),
+                );
             });
 
             if prev_setting != self.settings {
@@ -410,10 +438,7 @@ impl eframe::App for App {
                 .allow_double_click_reset(false)
                 .show(ui, |ui| {
                     if reset_zoom {
-                        ui.set_plot_bounds(PlotBounds::from_min_max(
-                            [0.0, -3.0],
-                            [STRING_POINTS as f64, 3.0],
-                        ))
+                        ui.set_plot_bounds(PlotBounds::from_min_max([0.0, -1.0], [128.0, 1.0]))
                     }
                     for (i, string) in self
                         .strings_snapshots_reader
