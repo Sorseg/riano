@@ -187,16 +187,29 @@ fn main() {
     // MIDI
     let midi_in = MidiInput::new("riano").unwrap();
     let in_ports = midi_in.ports();
-    let casio = in_ports
-        .iter()
-        .find(|p| midi_in.port_name(p).unwrap().contains("CASIO"))
-        .expect("casio not connected");
+    let device_to_search = std::env::args().nth(1);
 
-    println!("Connecting to {}", midi_in.port_name(casio).unwrap());
+    println!("Discovered MIDI devices:");
+    for p in &in_ports {
+        println!("{:?}", midi_in.port_name(p))
+    }
+
+    let midi_device = match device_to_search {
+        None => {
+            println!("Add part of the name as an argument");
+            std::process::exit(1);
+        }
+        Some(arg_p) => in_ports
+            .iter()
+            .find(|p| midi_in.port_name(p).unwrap().contains(&arg_p))
+            .unwrap_or_else(|| panic!("{arg_p:?} not found")),
+    };
+
+    println!("Connecting to {}", midi_in.port_name(midi_device).unwrap());
 
     let _conn = midi_in
         .connect(
-            casio,
+            midi_device,
             "reading midi",
             move |_t, m, _| {
                 let (m, _len) = MidiMsg::from_midi(m).unwrap();
