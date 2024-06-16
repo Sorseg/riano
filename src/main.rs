@@ -13,10 +13,8 @@ use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
     BufferSize,
 };
-
 use eframe::egui::{self, CentralPanel, Slider, Vec2b};
 use egui_plot::{Line, Plot, PlotBounds, PlotPoints};
-use glam::Vec2;
 use midi_msg::{ChannelVoiceMsg, MidiMsg};
 use midir::MidiInput;
 
@@ -174,7 +172,7 @@ impl PianoString {
 fn main() {
     let (pluck_sender, pluck_receiver) = channel();
 
-    let vis_buf = Arc::new(Mutex::new(VecDeque::<f32>::new()));
+    let vis_buf = Arc::new(Mutex::new(VecDeque::<f32>::with_capacity(VIS_BUF_SIZE * 2)));
     let buf2 = Arc::clone(&vis_buf);
 
     let strings_snapshots_writer: Arc<Mutex<Vec<Vec<f32>>>> = Arc::new(Mutex::new(vec![]));
@@ -473,3 +471,5 @@ impl eframe::App for App {
         });
     }
 }
+
+
