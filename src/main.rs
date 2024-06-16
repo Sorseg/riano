@@ -112,6 +112,8 @@ impl PianoString {
         let last = self.pos.len() - 1;
         self.pos[last].y = 0.0;
         self.pos[last - 1].y = 0.0;
+        self.vel[last] = Vec2::ZERO;
+        self.vel[last - 1] = Vec2::ZERO;
     }
 
     fn tick(&mut self) {
