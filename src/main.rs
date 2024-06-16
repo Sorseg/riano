@@ -1,7 +1,8 @@
 use std::{
     array,
+    cmp::Reverse,
     collections::VecDeque,
-    f32::consts::FRAC_PI_2,
+    f32::consts::{FRAC_PI_2, TAU},
     sync::{
         mpsc::{channel, Sender},
         Arc, Mutex,
@@ -13,34 +14,18 @@ use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
     BufferSize,
 };
-use eframe::egui::{self, CentralPanel, Slider, Vec2b};
+use eframe::egui::{self, CentralPanel, Color32, Grid, RichText, SidePanel, Slider, Vec2b};
 use egui_plot::{Line, Plot, PlotBounds, PlotPoints};
+use itertools::Itertools;
 use midi_msg::{ChannelVoiceMsg, MidiMsg};
 use midir::MidiInput;
+use rustfft::{
+    num_complex::{Complex, ComplexFloat},
+    Fft, FftPlanner,
+};
 
 const VIS_BUF_SECS: f32 = 4.0;
 const VIS_BUF_SIZE: usize = (44100.0 * VIS_BUF_SECS) as usize;
-
-#[derive(Debug, PartialEq, Clone)]
-struct Settings {
-    boost: f32,
-    inertia: [f32; 2],
-    tension: [f32; 2],
-    elasticity: [f32; 2],
-    string_length: [u32; 2],
-}
-
-impl Default for Settings {
-    fn default() -> Self {
-        Self {
-            boost: 1.0,
-            inertia: [12.0, 1.0],
-            tension: [1.0, 5.0],
-            elasticity: [0.1, 0.001],
-            string_length: [128, 32],
-        }
-    }
-}
 
 trait Lerp {
     fn lerp(&self, percent: f32) -> f32;
@@ -58,7 +43,11 @@ impl Lerp for [u32; 2] {
     }
 }
 
+#[derive(Clone)]
 struct PianoString {
+    expected_frequency: f32,
+    current_frequency: f32,
+    ran_away: bool,
     is_active: bool,
     tension: f32,
     inertia: f32,
@@ -69,9 +58,12 @@ struct PianoString {
 
 impl PianoString {
     /// tension should be less than inertia doubled
-    fn new() -> Self {
+    fn new(expected_frequency: f32) -> Self {
         Self {
+            expected_frequency,
+            current_frequency: 0.0,
             is_active: false,
+            ran_away: false,
             tension: 1.0,
             inertia: 5.0,
             elasticity: 0.001,
@@ -89,6 +81,7 @@ impl PianoString {
                 (distance_from_place_to_pluck / pluck_width as f32 * FRAC_PI_2).cos() * vel;
         }
         self.is_active = true;
+        self.ran_away = false;
     }
 
     fn listen(&self) -> f32 {
@@ -129,16 +122,16 @@ impl PianoString {
             }
             // check for runaway
             if self.pos[i].abs() > 1000.0 {
+                self.ran_away = true;
                 println!(
-                    "Runaway at tension {} inertia {}",
-                    self.tension, self.inertia
+                    "Runaway at tension {} inertia {} elasticity {}",
+                    self.tension, self.inertia, self.elasticity
                 );
 
-                println!("{:?}", self.pos);
-                println!("{:?}", self.vel);
+                // println!("{:?}", self.pos);
+                // println!("{:?}", self.vel);
 
-                self.vel.iter_mut().for_each(|p| *p = 0.0);
-                self.pos.iter_mut().for_each(|p| *p = 0.0);
+                self.reset();
                 return;
             }
         }
@@ -167,6 +160,11 @@ impl PianoString {
 
         self.is_active = is_now_active;
     }
+
+    fn reset(&mut self) {
+        self.pos.iter_mut().for_each(|p| *p = 0.0);
+        self.vel.iter_mut().for_each(|p| *p = 0.0);
+    }
 }
 
 fn main() {
@@ -174,12 +172,6 @@ fn main() {
 
     let vis_buf = Arc::new(Mutex::new(VecDeque::<f32>::with_capacity(VIS_BUF_SIZE * 2)));
     let buf2 = Arc::clone(&vis_buf);
-
-    let strings_snapshots_writer: Arc<Mutex<Vec<Vec<f32>>>> = Arc::new(Mutex::new(vec![]));
-    let strings_snapshots_reader = Arc::clone(&strings_snapshots_writer);
-    let strings_snapshot_refresh_ms = 10;
-
-    let (settings_sender, settings_reader) = channel::<Settings>();
 
     // MIDI
     let midi_in = MidiInput::new("riano").unwrap();
@@ -233,18 +225,29 @@ fn main() {
     let dev = host.default_output_device().unwrap();
     let mut config: cpal::StreamConfig = dev.default_output_config().unwrap().into();
     config.buffer_size = BufferSize::Fixed(256);
+    let sample_rate = config.sample_rate.0;
     println!("{config:?}");
 
-    let mut strings: [PianoString; 128] = array::from_fn(|_| PianoString::new());
+    let strings: Arc<Mutex<[PianoString; 128]>> = Arc::new(Mutex::new(array::from_fn(|i| {
+        PianoString::new(440.0 * 2_f32.powf((i as f32 - 69.0) / 12.0))
+    })));
+    for (i, s) in strings.lock().unwrap().iter_mut().enumerate() {
+        let perc = i as f32 / 128.0;
+        s.resize([128, 24].lerp(perc) as usize);
+        s.elasticity = [0.4, 0.001].lerp(perc);
+        s.inertia = [10.0, 1.0].lerp(perc);
+        s.tension = 0.1;
+    }
+    let strings_reader = Arc::clone(&strings);
 
     let mut start = Instant::now();
-
-    let mut boost = 1.0;
 
     let stream = dev
         .build_output_stream(
             &config,
             move |data: &mut [f32], _| {
+                // care with deadlocks, do not lock anything, while holding this
+                let mut strings = strings.lock().unwrap();
                 while let Ok((string_n, vel)) = pluck_receiver.try_recv() {
                     let string = &mut strings[string_n as usize];
                     string.pluck(vel as f32 / 255.0);
@@ -253,48 +256,24 @@ fn main() {
                         string_n, string.tension, string.inertia, string.elasticity
                     );
                 }
-                if let Ok(setting) = settings_reader.try_recv() {
-                    boost = setting.boost;
-
-                    let denominator = (strings.len() - 1) as f32;
-                    for (i, string) in strings.iter_mut().enumerate() {
-                        let percent = i as f32 / denominator;
-                        string.inertia = setting.inertia.lerp(percent);
-                        string.tension = setting.tension.lerp(percent);
-                        string.elasticity = setting.elasticity.lerp(percent);
-                        let new_size = setting.string_length.lerp(percent) as usize;
-                        string.resize(new_size);
-                    }
-                }
 
                 for c in data.chunks_exact_mut(2) {
                     strings.iter_mut().for_each(PianoString::tick);
 
-                    if start.elapsed().as_millis() >= strings_snapshot_refresh_ms {
-                        start = Instant::now();
-                        // takes ~5 us for 10 strings
-                        let snap = strings
-                            .iter()
-                            .filter(|s| s.is_active)
-                            .map(|s| s.pos.to_vec())
-                            .collect();
-                        *strings_snapshots_writer.lock().unwrap() = snap;
-                    }
                     // left
                     c[0] = strings
                         .iter()
                         .filter(|s| s.is_active)
                         .map(|s| s.listen())
-                        .sum::<f32>()
-                        * boost;
+                        .sum::<f32>();
                     // right
                     c[1] = strings
                         .iter()
                         .filter(|s| s.is_active)
                         .map(|s| s.listen())
-                        .sum::<f32>()
-                        * boost;
+                        .sum::<f32>();
                 }
+                drop(strings);
 
                 let mut vis_buf = vis_buf.lock().unwrap();
                 vis_buf.extend(data.iter().copied());
@@ -315,15 +294,13 @@ fn main() {
             viewport: eframe::egui::ViewportBuilder::default().with_inner_size([800.0, 500.0]),
             ..Default::default()
         },
-        Box::new(|_cc| {
-            settings_sender.send(Settings::default()).unwrap();
-
+        Box::new(move |_cc| {
             Box::new(App {
                 vis_buf: buf2,
                 locked: vec![],
-                settings_sender,
-                settings: Settings::default(),
-                strings_snapshots_reader,
+                frequency_detector: FreqDetector::new(4096 * 8, sample_rate as usize),
+
+                strings_editor: strings_reader,
             })
         }),
     )
@@ -333,9 +310,8 @@ fn main() {
 struct App {
     vis_buf: Arc<Mutex<VecDeque<f32>>>,
     locked: Vec<f32>,
-    settings_sender: Sender<Settings>,
-    settings: Settings,
-    strings_snapshots_reader: Arc<Mutex<Vec<Vec<f32>>>>,
+    strings_editor: Arc<Mutex<[PianoString; 128]>>,
+    frequency_detector: FreqDetector,
 }
 
 impl eframe::App for App {
@@ -347,6 +323,64 @@ impl eframe::App for App {
         for _ in 0..to_remove {
             buf.pop_front();
         }
+        SidePanel::left("strings settings").show(ctx, |ui| {
+            let mut strings = self.strings_editor.lock().unwrap();
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                Grid::new("strings settings items")
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.label("MIDI #");
+                        ui.label("expected freq");
+                        ui.label("current freq");
+                        ui.end_row();
+
+                        for (i, s) in strings.iter_mut().enumerate() {
+                            ui.label(RichText::new(format!("{i}")).background_color(
+                                Color32::from_rgb(
+                                    if s.ran_away { 255 } else { 0 },
+                                    (s.pos.iter().sum::<f32>().abs() * 255.0) as u8,
+                                    0,
+                                ),
+                            ));
+                            if ui
+                                .label(format!("{:.1}", s.expected_frequency))
+                                .on_hover_text("tune")
+                                .clicked()
+                            {
+                                todo!("tune");
+                            }
+                            if ui
+                                .label(format!("{:.1}", s.current_frequency))
+                                .on_hover_text("detect")
+                                .clicked()
+                            {
+                                let mut s_clone = s.clone();
+                                s.current_frequency =
+                                    measure(&mut s_clone, &self.frequency_detector);
+                            }
+                            ui.vertical(|ui| {
+                                ui.add(
+                                    Slider::new(&mut s.inertia, 0.0001..=100.0)
+                                        .logarithmic(true)
+                                        .text("inertia"),
+                                );
+                                ui.add(
+                                    Slider::new(&mut s.tension, 0.0001..=100.0)
+                                        .logarithmic(true)
+                                        .text("tension"),
+                                );
+                                ui.add(
+                                    Slider::new(&mut s.elasticity, 0.0001..=100.0)
+                                        .logarithmic(true)
+                                        .text("elasticity"),
+                                );
+                            });
+                            ui.end_row();
+                        }
+                    })
+            });
+            drop(strings);
+        });
 
         CentralPanel::default().show(ctx, |ui| {
             let mut reset_zoom = false;
@@ -361,47 +395,34 @@ impl eframe::App for App {
                 reset_zoom = ui.button("reset zoom").clicked();
             });
 
-            let prev_setting = self.settings.clone();
-            let width = ui.available_width() * 0.8;
-            let size = egui::Vec2::new(width, 5.0);
-            ui.style_mut().spacing.slider_width = 300.0;
-            ui.add_sized(
-                size,
-                Slider::new(&mut self.settings.boost, 0.1..=5.0).text("boost"),
-            );
-            ui.group(|ui| {
-                for (val, name) in [
-                    (&mut self.settings.inertia, "inertia"),
-                    (&mut self.settings.tension, "tension"),
-                    (&mut self.settings.elasticity, "elasticity"),
-                ] {
-                    ui.add_sized(
-                        size,
-                        Slider::new(&mut val[0], 0.00001..=100.0)
-                            .logarithmic(true)
-                            .text(format!("lowest {name}")),
-                    );
-                    ui.add_sized(
-                        size,
-                        Slider::new(&mut val[1], 0.00001..=100.0)
-                            .logarithmic(true)
-                            .text(format!("highest {name}")),
-                    );
-                    ui.separator();
-                }
-                ui.add(
-                    Slider::new(&mut self.settings.string_length[0], 32..=256)
-                        .text("lowest length"),
-                );
-                ui.add(
-                    Slider::new(&mut self.settings.string_length[1], 32..=256)
-                        .text("highest length"),
-                );
-            });
-
-            if prev_setting != self.settings {
-                self.settings_sender.send(self.settings.clone()).unwrap();
-            }
+            // ui.group(|ui| {
+            //     for (val, name) in [
+            //         (&mut self.settings.inertia, "inertia"),
+            //         (&mut self.settings.elasticity, "elasticity"),
+            //     ] {
+            //         ui.add_sized(
+            //             size,
+            //             Slider::new(&mut val[0], 0.00001..=100.0)
+            //                 .logarithmic(true)
+            //                 .text(format!("lowest {name}")),
+            //         );
+            //         ui.add_sized(
+            //             size,
+            //             Slider::new(&mut val[1], 0.00001..=100.0)
+            //                 .logarithmic(true)
+            //                 .text(format!("highest {name}")),
+            //         );
+            //         ui.separator();
+            //     }
+            //     ui.add(
+            //         Slider::new(&mut self.settings.string_length[0], 32..=256)
+            //             .text("lowest length"),
+            //     );
+            //     ui.add(
+            //         Slider::new(&mut self.settings.string_length[1], 32..=256)
+            //             .text("highest length"),
+            //     );
+            // });
 
             Plot::new("waveform")
                 .auto_bounds(Vec2b { x: true, y: false })
@@ -443,33 +464,179 @@ impl eframe::App for App {
                     ui.line(Line::new(locked).name("locked"));
                 });
 
-            Plot::new("strings")
+            Plot::new("strings vis")
                 .auto_bounds(Vec2b { x: true, y: false })
                 .allow_double_click_reset(false)
                 .show(ui, |ui| {
                     if reset_zoom {
                         ui.set_plot_bounds(PlotBounds::from_min_max([0.0, -1.0], [128.0, 1.0]))
                     }
-                    for (i, string) in self
-                        .strings_snapshots_reader
-                        .lock()
-                        .unwrap()
-                        .iter()
-                        .enumerate()
-                    {
-                        let line = Line::new(
-                            string
-                                .iter()
-                                .enumerate()
-                                .map(|(i, v)| [i as f64, *v as f64 * self.settings.boost as f64])
-                                .collect::<PlotPoints>(),
-                        )
-                        .name(&format!("string {i}"));
-                        ui.line(line);
-                    }
+                    // for (i, string) in self
+                    //     .strings_reader
+                    //     .lock()
+                    //     .unwrap()
+                    //     .iter()
+                    //     .enumerate()
+                    // {
+                    //     // let line = Line::new(
+                    //     //     string
+                    //     //         .iter()
+                    //     //         .enumerate()
+                    //     //         .map(|(i, v)| [i as f64, *v as f64 * self.settings.boost as f64])
+                    //     //         .collect::<PlotPoints>(),
+                    //     // )
+                    //     // .name(&format!("string {i}"));
+                    //     // ui.line(line);
+                    // }
                 });
         });
     }
 }
 
+fn measure(s: &mut PianoString, freq_detector: &FreqDetector) -> f32 {
+    s.reset();
+    s.pluck(0.5);
+    // make sure the wave propagates through
+    for _ in 0..40000 {
+        s.tick();
+    }
+    let samples = (0..freq_detector.sample_count)
+        .map(|_| {
+            s.tick();
+            s.listen()
+        })
+        .collect_vec();
 
+    freq_detector.detect(&samples)
+}
+
+/// smarter frequency detection
+struct FreqDetector {
+    fft: Arc<dyn Fft<f32>>,
+    sample_count: usize,
+    sample_rate: usize,
+}
+
+impl FreqDetector {
+    fn new(sample_count: usize, sample_rate: usize) -> Self {
+        let mut planner = FftPlanner::new();
+        Self {
+            fft: planner.plan_fft_forward(sample_count),
+
+            sample_count,
+            sample_rate,
+        }
+    }
+
+    fn detect(&self, samples: &[f32]) -> f32 {
+        let mut buf = samples
+            .iter()
+            .copied()
+            .map(|s| Complex { re: s, im: 0.0 })
+            .collect_vec();
+
+        self.fft.process(&mut buf);
+
+        let peak = buf
+            .iter()
+            .copied()
+            .enumerate()
+            .take(self.sample_count / 2)
+            .max_by_key(|(_, s)| (s.abs() * 1000.0) as u32)
+            .expect("to have at least 1 sample");
+        if peak.1.abs() < 0.001 {
+            return 0.0;
+        }
+
+        // use neighbors for anti-aliasing
+        let mut neighbors = Vec::with_capacity(3);
+        neighbors.push(peak);
+        if peak.0 > 1 {
+            neighbors.push((peak.0 - 1, buf[peak.0 - 1]));
+        }
+        if peak.0 < (self.sample_count / 2 - 1) {
+            neighbors.push((peak.0 + 1, buf[peak.0 + 1]));
+        }
+
+        neighbors.sort_unstable_by(|c1, c2| c1.1.abs().total_cmp(&c2.1.abs()).reverse());
+        // only take the two top values
+        neighbors.truncate(2);
+        // take weighted average of the two biggest
+        let res = (self.fft_bucket_to_freq(neighbors[0].0) * neighbors[0].1.abs()
+            + self.fft_bucket_to_freq(neighbors[1].0) * neighbors[1].1.abs())
+            / (neighbors[0].1.abs() + neighbors[1].1.abs());
+        if res.is_nan() {
+            panic!("{neighbors:?}");
+        } else {
+            res
+        }
+    }
+
+    fn fft_bucket_to_freq(&self, bucket: usize) -> f32 {
+        bucket as f32 * self.sample_rate as f32 / self.sample_count as f32
+    }
+}
+
+fn tune(freq_detector: &FreqDetector, s: &mut PianoString, target_freq: f32) {
+    // cloning so playing this string does not disturb current playback
+    let mut s2 = s.clone();
+    let mut prev_meas: Option<(f32, f32)> = None;
+    for _try in 0..100 {
+        let current_freq = measure(&mut s2, &freq_detector);
+
+        let error = target_freq - current_freq;
+        if error.abs() < target_freq * 0.08 {
+            println!("tuned");
+        }
+        if error.abs() > target_freq * 2.0 {
+            println!(
+                "String is too far from tune, cur: {} targ: {}",
+                current_freq, target_freq
+            );
+            return;
+        }
+        let tension_adjust = match prev_meas {
+            None => {
+                // try something to measure the initial change in frequency
+                error * 0.001
+            }
+            // try to predict the linear change
+            Some((prev_tens, prev_freq)) => {
+                let mut denom = (current_freq - prev_freq).clamp(-10.0, 10.0);
+                // do not divide by 0
+                if denom.abs() < 0.001 {
+                    denom = 0.001 * denom.signum();
+                }
+                let perc = ((current_freq - target_freq) / denom).clamp(-10.0, 10.0);
+                ((s2.tension - prev_tens) * perc).clamp(-0.1, 0.1)
+            }
+        };
+        prev_meas = Some((s2.tension, current_freq));
+        s2.tension = (s2.tension + tension_adjust).clamp(0.001, 100.0);
+        s.tension = s2.tension;
+    }
+    println!("Giving up");
+}
+
+#[test]
+fn freq_detector_smoke_test() {
+    let samples = 4096 * 8;
+    let freq_detector = FreqDetector::new(samples, 44100);
+
+    for freq in [10, 100, 1000, 2000] {
+        let sin_samples = (0..samples)
+            .map(|i| {
+                (i as f32 / 44100.0 * freq as f32 * TAU).sin()
+                // noise
+                + (i as f32 / 100.0).sin() * 0.1
+            })
+            .collect_vec();
+
+        let detected_freq = freq_detector.detect(&sin_samples);
+        dbg!(detected_freq, freq);
+        assert!(
+            (detected_freq - freq as f32).abs() < 1.0,
+            "detected {detected_freq} expected {freq}"
+        );
+    }
+}
