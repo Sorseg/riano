@@ -395,11 +395,11 @@ impl eframe::App for App {
                 }
                 ui.add(
                     Slider::new(&mut self.settings.string_length[0], 32..=256)
-                        .text("highest length"),
+                        .text("lowest length"),
                 );
                 ui.add(
                     Slider::new(&mut self.settings.string_length[1], 32..=256)
-                        .text("lowest length"),
+                        .text("highest length"),
                 );
             });
 
