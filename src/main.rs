@@ -65,9 +65,8 @@ struct PianoString {
     tension: f32,
     inertia: f32,
     elasticity: f32,
-    // x,y
-    pos: Vec<Vec2>,
-    vel: Vec<Vec2>,
+    pos: Vec<f32>,
+    vel: Vec<f32>,
 }
 
 impl PianoString {
@@ -88,32 +87,29 @@ impl PianoString {
         let pluck_width = (self.pos.len() as f32 * 0.1) as usize;
         for i in (place_to_pluck - pluck_width)..=(place_to_pluck + pluck_width) {
             let distance_from_place_to_pluck = i as f32 - place_to_pluck as f32;
-            self.vel[i].y =
+            self.vel[i] =
                 (distance_from_place_to_pluck / pluck_width as f32 * FRAC_PI_2).cos() * vel;
         }
         self.is_active = true;
     }
 
     fn listen(&self) -> f32 {
-        self.pos[4].y
+        self.pos[4]
     }
 
     /// needs to be called before plucking
     fn resize(&mut self, new_size: usize) {
         assert!(new_size > 4);
-        self.pos.truncate(new_size);
-        self.vel.truncate(new_size);
-        while self.pos.len() < new_size {
-            self.pos.push(Vec2::new(self.pos.len() as f32, 0.0));
-            self.vel.push(Vec2::ZERO);
-        }
+        self.pos.resize(new_size, 0.0);
+        self.vel.resize(new_size, 0.0);
 
         // make sure the string is still attached horizontaly
+        // and not flying away
         let last = self.pos.len() - 1;
-        self.pos[last].y = 0.0;
-        self.pos[last - 1].y = 0.0;
-        self.vel[last] = Vec2::ZERO;
-        self.vel[last - 1] = Vec2::ZERO;
+        self.pos[last] = 0.0;
+        self.pos[last - 1] = 0.0;
+        self.vel[last] = 0.0;
+        self.vel[last - 1] = 0.0;
     }
 
     fn tick(&mut self) {
@@ -130,11 +126,11 @@ impl PianoString {
         for i in 1..(self.pos.len() - 1) {
             self.pos[i] += self.vel[i] / self.inertia;
 
-            if self.pos[i].y.abs() > active_thresh {
+            if self.pos[i].abs() > active_thresh {
                 is_now_active = true;
             }
             // check for runaway
-            if self.pos[i].y.abs() > 1000.0 {
+            if self.pos[i].abs() > 1000.0 {
                 println!(
                     "Runaway at tension {} inertia {}",
                     self.tension, self.inertia
@@ -143,8 +139,8 @@ impl PianoString {
                 println!("{:?}", self.pos);
                 println!("{:?}", self.vel);
 
-                self.vel.iter_mut().for_each(|p| *p = Vec2::ZERO);
-                self.pos.iter_mut().for_each(|p| *p = Vec2::ZERO);
+                self.vel.iter_mut().for_each(|p| *p = 0.0);
+                self.pos.iter_mut().for_each(|p| *p = 0.0);
                 return;
             }
         }
@@ -166,7 +162,7 @@ impl PianoString {
             self.vel[i] += tension_force * self.tension + elastic_force * self.elasticity;
             self.vel[i] *= 1.0 - damping;
 
-            if self.vel[i].y.abs() > active_thresh {
+            if self.vel[i].abs() > active_thresh {
                 is_now_active = true;
             }
         }
@@ -181,7 +177,7 @@ fn main() {
     let vis_buf = Arc::new(Mutex::new(VecDeque::<f32>::new()));
     let buf2 = Arc::clone(&vis_buf);
 
-    let strings_snapshots_writer: Arc<Mutex<Vec<Vec<Vec2>>>> = Arc::new(Mutex::new(vec![]));
+    let strings_snapshots_writer: Arc<Mutex<Vec<Vec<f32>>>> = Arc::new(Mutex::new(vec![]));
     let strings_snapshots_reader = Arc::clone(&strings_snapshots_writer);
     let strings_snapshot_refresh_ms = 10;
 
@@ -341,7 +337,7 @@ struct App {
     locked: Vec<f32>,
     settings_sender: Sender<Settings>,
     settings: Settings,
-    strings_snapshots_reader: Arc<Mutex<Vec<Vec<Vec2>>>>,
+    strings_snapshots_reader: Arc<Mutex<Vec<Vec<f32>>>>,
 }
 
 impl eframe::App for App {
@@ -466,7 +462,8 @@ impl eframe::App for App {
                         let line = Line::new(
                             string
                                 .iter()
-                                .map(|p| [p.x as f64, p.y as f64 * self.settings.boost as f64])
+                                .enumerate()
+                                .map(|(i, v)| [i as f64, *v as f64 * self.settings.boost as f64])
                                 .collect::<PlotPoints>(),
                         )
                         .name(&format!("string {i}"));
