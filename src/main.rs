@@ -97,7 +97,8 @@ impl PianoString {
     fn listen(&self) -> f32 {
         self.pos[4].y
     }
-    /// needs to be called bo
+
+    /// needs to be called before plucking
     fn resize(&mut self, new_size: usize) {
         assert!(new_size > 4);
         self.pos.truncate(new_size);
