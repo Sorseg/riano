@@ -1,6 +1,7 @@
 use std::{
     array,
     collections::VecDeque,
+    f32::consts::PI,
     sync::{
         atomic::{AtomicI32, Ordering},
         mpsc::channel,
@@ -53,32 +54,38 @@ struct PianoString<const N: usize> {
     vel: [Vec2; N],
 }
 impl<const N: usize> PianoString<N> {
+    /// tension should be less than inertia doubled
     fn new(tension: f32, inertia: f32) -> Self {
+        let inertia = inertia.clamp(0.1, 1000.0);
+        let tension = tension.clamp(0.01, inertia * 1.99);
+
         Self {
             is_active: false,
-            tension: tension.clamp(0.1, 10.0),
-            inertia: inertia.clamp(1.0, 1000.0),
+            tension,
+            inertia,
             pos: array::from_fn(|i| Vec2::new(i as f32, 0.0)),
             vel: array::from_fn(|_| Vec2::new(0.0, 0.0)),
         }
     }
     fn pluck(&mut self, vel: f32) {
         let vel = vel.clamp(0.0, 1.0);
-        for i in 0..N / 4 {
-            self.vel[i].y = (i as f32 / N as f32 / 4.0) * vel;
-        }
-        for i in N / 4..N {
-            self.vel[i].y = (N as f32 - i as f32) / N as f32 * vel;
+        let place_to_pluck = 20.clamp(0, N);
+        let pluck_width = 9.clamp(0, N);
+        for i in (place_to_pluck - pluck_width)..=(place_to_pluck + pluck_width) {
+            let distance_from_place_to_pluck = i as f32 - place_to_pluck as f32;
+            self.vel[i].y = (distance_from_place_to_pluck / pluck_width as f32 * PI).cos() * vel;
         }
         self.is_active = true;
     }
+
     fn tick(&mut self) {
         if !self.is_active {
             return;
         }
 
-        let mut is_active = false;
+        let mut is_now_active = false;
         let active_thresh = 0.0001;
+
         let damping = 0.0001;
 
         // apply velocity
@@ -86,17 +93,10 @@ impl<const N: usize> PianoString<N> {
             self.pos[i] += self.vel[i] / self.inertia;
 
             if self.pos[i].y.abs() > active_thresh {
-                is_active = true;
+                is_now_active = true;
             }
-        }
-
-        // apply elasticity
-        for i in 1..(self.pos.len() - 1) {
-            let force = (self.pos[i - 1] + self.pos[i + 1]) / 2.0 - self.pos[i];
-            self.vel[i] += force * self.tension;
-            self.vel[i] *= 1.0 - damping;
-
-            if self.vel[i].y.abs() > 50.0 {
+            // check for runaway
+            if self.pos[i].y.abs() > 1000.0 {
                 println!(
                     "Runaway at tension {} inertia {}",
                     self.tension, self.inertia
@@ -109,21 +109,47 @@ impl<const N: usize> PianoString<N> {
                 self.pos.iter_mut().for_each(|p| *p = Vec2::ZERO);
                 return;
             }
+        }
+
+        // apply tension and elasticity
+        let elasticity = 0.01;
+        for i in 2..(self.pos.len() - 2) {
+
+            let straight_from_left = self.pos[i - 1] - self.pos[i - 2];
+            let left_force_target = self.pos[i - 1] + straight_from_left * 2.0;
+
+            let right_vec = self.pos[i + 1] - self.pos[i + 2];
+            let right_vec_target = self.pos[i + 1] + right_vec * 2.0;
+
+            let elastic_force_target = (left_force_target + right_vec_target) / 2.0;
+            let tension_force_target = (self.pos[i - 1] + self.pos[i + 1]) / 2.0;
+
+            let tension_force = tension_force_target - self.pos[i];
+            let elastic_force = elastic_force_target - self.pos[i];
+
+            self.vel[i] += tension_force * self.tension + elastic_force * elasticity;
+            self.vel[i] *= 1.0 - damping;
 
             if self.vel[i].y.abs() > active_thresh {
-                is_active = true;
+                is_now_active = true;
             }
         }
 
-        self.is_active = is_active;
+        self.is_active = is_now_active;
     }
 }
 
+const STRING_POINTS: usize = 64;
+
 fn main() {
-    let (impulse_sender, impulse_receiver) = channel();
+    let (pluck_sender, pluck_receiver) = channel();
 
     let vis_buf = Arc::new(Mutex::new(VecDeque::<f32>::new()));
     let buf2 = Arc::clone(&vis_buf);
+
+    let strings_snapshots_writer: Arc<Mutex<Vec<Vec<Vec2>>>> = Arc::new(Mutex::new(vec![]));
+    let strings_snapshots_reader = Arc::clone(&strings_snapshots_writer);
+    let strings_snapshot_refresh_ms = 10;
 
     let settings_writer = Arc::new(Settings::default());
     let settings_reader = Arc::clone(&settings_writer);
@@ -149,7 +175,7 @@ fn main() {
                     ..
                 } = m
                 {
-                    impulse_sender.send((note, velocity)).unwrap();
+                    pluck_sender.send((note, velocity)).unwrap();
                 }
 
                 if let MidiMsg::ChannelVoice {
@@ -169,15 +195,15 @@ fn main() {
     config.buffer_size = BufferSize::Fixed(256);
     println!("{config:?}");
 
-    let mut strings: [PianoString<64>; 128] =
-        array::from_fn(|i| PianoString::new(i as f32 / 10.0 - 5.0, 30.0 - i as f32 / 2.0));
+    let mut strings: [PianoString<STRING_POINTS>; 128] =
+        array::from_fn(|i| PianoString::new(i as f32 / 100.0, 10.0));
     let mut start = Instant::now();
 
     let stream = dev
         .build_output_stream(
             &config,
             move |data: &mut [f32], _| {
-                while let Ok((string_n, vel)) = impulse_receiver.try_recv() {
+                while let Ok((string_n, vel)) = pluck_receiver.try_recv() {
                     let string = &mut strings[string_n as usize];
                     string.pluck(vel as f32 / 255.0);
                     println!(
@@ -185,15 +211,21 @@ fn main() {
                         string_n, string.tension, string.inertia
                     );
                 }
-                let amplification = 0.2;
+                let amplification = 0.8;
 
                 for c in data.chunks_exact_mut(2) {
                     for s in &mut strings {
                         s.tick();
                     }
-                    if start.elapsed().as_millis() > 100 {
-                        // println!("{:?}", strings[50].pos);
+                    if start.elapsed().as_millis() >= strings_snapshot_refresh_ms {
                         start = Instant::now();
+                        // takes ~5 us for 10 strings
+                        let snap = strings
+                            .iter()
+                            .filter(|s| s.is_active)
+                            .map(|s| s.pos.to_vec())
+                            .collect();
+                        *strings_snapshots_writer.lock().unwrap() = snap;
                     }
                     // left
                     c[0] = strings
@@ -232,6 +264,7 @@ fn main() {
                 vis_buf: buf2,
                 locked: vec![],
                 settings: settings_writer,
+                strings_snapshots_reader,
             })
         }),
     )
@@ -242,6 +275,7 @@ struct App {
     vis_buf: Arc<Mutex<VecDeque<f32>>>,
     locked: Vec<f32>,
     settings: Arc<Settings>,
+    strings_snapshots_reader: Arc<Mutex<Vec<Vec<Vec2>>>>,
 }
 
 impl eframe::App for App {
@@ -289,6 +323,7 @@ impl eframe::App for App {
             Plot::new("waveform")
                 .auto_bounds(Vec2b { x: true, y: false })
                 .allow_double_click_reset(false)
+                .height(ui.available_height() / 2.0)
                 .show(ui, |ui| {
                     if reset_zoom {
                         ui.set_plot_bounds(PlotBounds::from_min_max(
@@ -323,6 +358,34 @@ impl eframe::App for App {
                     ui.line(Line::new(left).name("left"));
                     ui.line(Line::new(right).name("right"));
                     ui.line(Line::new(locked).name("locked"));
+                });
+
+            Plot::new("strings")
+                .auto_bounds(Vec2b { x: true, y: false })
+                .allow_double_click_reset(false)
+                .show(ui, |ui| {
+                    if reset_zoom {
+                        ui.set_plot_bounds(PlotBounds::from_min_max(
+                            [0.0, -3.0],
+                            [STRING_POINTS as f64, 3.0],
+                        ))
+                    }
+                    for (i, string) in self
+                        .strings_snapshots_reader
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .enumerate()
+                    {
+                        let line = Line::new(
+                            string
+                                .iter()
+                                .map(|p| [p.x as f64, p.y as f64])
+                                .collect::<PlotPoints>(),
+                        )
+                        .name(&format!("string {i}"));
+                        ui.line(line);
+                    }
                 });
         });
     }
