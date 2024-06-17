@@ -5,7 +5,7 @@ use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc::channel,
-        Arc, Mutex,
+        Arc, Mutex, RwLock,
     },
 };
 
@@ -18,6 +18,7 @@ use egui_plot::{Arrows, Line, Plot, PlotBounds, PlotPoints};
 use itertools::Itertools;
 use midi_msg::{ChannelVoiceMsg, MidiMsg};
 use midir::MidiInput;
+use rayon::iter::{IntoParallelRefMutIterator, ParallelIterator};
 use rustfft::{
     num_complex::{Complex, ComplexFloat},
     Fft, FftPlanner,
@@ -107,8 +108,11 @@ impl PianoString {
         self.state.ran_away = false;
     }
 
-    fn listen(&self) -> f32 {
+    fn listen_left(&self) -> f32 {
         self.state.pos[(self.state.pos.len() as f32 * 0.2) as usize]
+    }
+    fn listen_right(&self) -> f32 {
+        self.state.pos[(self.state.pos.len() as f32 * 0.25) as usize]
     }
 
     /// needs to be called before plucking
@@ -252,6 +256,7 @@ fn main() {
     let dev = host.default_output_device().unwrap();
     let mut config: cpal::StreamConfig = dev.default_output_config().unwrap().into();
     config.buffer_size = BufferSize::Fixed(256);
+    assert_eq!(config.channels, 2);
     let sample_rate = config.sample_rate.0;
     println!("{config:?}");
 
@@ -276,7 +281,7 @@ fn main() {
         }
     };
 
-    let strings: Arc<Mutex<Vec<PianoString>>> = Arc::new(Mutex::new(
+    let strings: Arc<RwLock<Vec<PianoString>>> = Arc::new(RwLock::new(
         piano_config.strings.into_iter().map(Into::into).collect(),
     ));
 
@@ -286,32 +291,36 @@ fn main() {
         .build_output_stream(
             &config,
             move |data: &mut [f32], _| {
-                // care with deadlocks, do not lock anything, while holding this
-                let mut strings = strings.lock().unwrap();
                 while let Ok((string_n, vel)) = pluck_receiver.try_recv() {
-                    let string = &mut strings[string_n as usize];
-                    string.pluck(vel as f32 / 255.0, 0.3, 0.2);
-                    println!("playing string {} {:?}", string_n, string.conf);
+                    strings.write().unwrap()[string_n as usize].pluck(vel as f32 / 255.0, 0.3, 0.2);
+                    println!("playing string {}", string_n);
                 }
 
-                for c in data.chunks_exact_mut(2) {
-                    strings.iter_mut().for_each(PianoString::tick);
+                let buf_len = data.len();
+                let buffers = strings
+                    .write()
+                    .unwrap()
+                    .par_iter_mut()
+                    .filter(|s| s.state.is_active)
+                    .map(|s| {
+                        (0..(buf_len / 2))
+                            .flat_map(|_| {
+                                s.tick();
+                                [s.listen_left(), s.listen_right()]
+                            })
+                            .collect_vec()
+                    })
+                    .reduce(
+                        || vec![0.0; buf_len],
+                        |mut l, r| {
+                            l.iter_mut().zip(r).for_each(|(l, r)| *l += r);
+                            l
+                        },
+                    );
 
-                    // left
-                    c[0] = strings
-                        .iter()
-                        .filter(|s| s.state.is_active)
-                        .map(|s| s.listen())
-                        .sum::<f32>();
-
-                    // right
-                    c[1] = strings
-                        .iter()
-                        .filter(|s| s.state.is_active)
-                        .map(|s| s.listen())
-                        .sum::<f32>();
+                for (buffer_out, buffer_calc) in data.iter_mut().zip(buffers) {
+                    *buffer_out = buffer_calc
                 }
-                drop(strings);
 
                 let mut vis_buf = vis_buf.lock().unwrap();
                 vis_buf.extend(data.iter().copied());
@@ -348,7 +357,7 @@ fn main() {
 struct App {
     vis_buf: Arc<Mutex<VecDeque<f32>>>,
     locked: Vec<f32>,
-    strings_editor: Arc<Mutex<Vec<PianoString>>>,
+    strings_editor: Arc<RwLock<Vec<PianoString>>>,
     freq_detector: FreqDetector,
     sim_string: Option<PianoString>,
 }
@@ -391,7 +400,10 @@ impl eframe::App for App {
                             .zip(&s.state.pos)
                             .map(|((i, v), p)| [i as f64, (v + *p) as f64])
                             .collect::<PlotPoints>();
-                        ui.arrows(Arrows::new(pos_iter.clone().collect::<PlotPoints>(), vel).tip_length(10.0));
+                        ui.arrows(
+                            Arrows::new(pos_iter.clone().collect::<PlotPoints>(), vel)
+                                .tip_length(10.0),
+                        );
                     });
                 });
             if !open {
@@ -414,7 +426,7 @@ impl eframe::App for App {
                         {
                             if STOP_TUNING.load(Ordering::Relaxed) {
                                 STOP_TUNING.store(false, Ordering::Relaxed);
-                                let strings_n = self.strings_editor.lock().unwrap().len();
+                                let strings_n = self.strings_editor.read().unwrap().len();
 
                                 for i in 0..strings_n {
                                     let strings = Arc::clone(&self.strings_editor);
@@ -423,10 +435,10 @@ impl eframe::App for App {
                                         if STOP_TUNING.load(Ordering::Relaxed) {
                                             return;
                                         }
-                                        let mut s = strings.lock().unwrap()[i].clone();
+                                        let mut s = strings.read().unwrap()[i].clone();
                                         let target_freq = s.conf.expected_frequency;
                                         let current_freq = tune(&fd, &mut s, target_freq);
-                                        let actual_s = &mut strings.lock().unwrap()[i];
+                                        let actual_s = &mut strings.write().unwrap()[i];
                                         actual_s.conf.tension = s.conf.tension;
                                         actual_s.state.current_frequency = current_freq;
                                     });
@@ -440,21 +452,21 @@ impl eframe::App for App {
                             .on_hover_text("measure all")
                             .clicked()
                         {
-                            let s_num = self.strings_editor.lock().unwrap().len();
+                            let s_num = self.strings_editor.read().unwrap().len();
                             let fd = Arc::new(self.freq_detector.clone());
                             for i in 0..s_num {
                                 let strings = Arc::clone(&self.strings_editor);
                                 let fd = Arc::clone(&fd);
                                 rayon::spawn(move || {
-                                    let mut s = strings.lock().unwrap()[i].clone();
+                                    let mut s = strings.read().unwrap()[i].clone();
                                     let res = measure(&mut s, &fd);
-                                    strings.lock().unwrap()[i].state.current_frequency = res;
+                                    strings.write().unwrap()[i].state.current_frequency = res;
                                 });
                             }
                         }
                         ui.end_row();
-
-                        for (i, s) in self.strings_editor.lock().unwrap().iter_mut().enumerate() {
+                        // FIXME: write conf after the render
+                        for (i, s) in self.strings_editor.write().unwrap().iter_mut().enumerate() {
                             ui.label(RichText::new(format!("{i}")).background_color(
                                 Color32::from_rgb(
                                     if s.state.ran_away { 255 } else { 0 },
@@ -528,7 +540,7 @@ impl eframe::App for App {
                     self.locked.clear();
                 }
                 if ui.button("save").clicked() {
-                    let strings = self.strings_editor.lock().unwrap();
+                    let strings = self.strings_editor.read().unwrap();
                     std::fs::write(
                         config_path(),
                         serde_json::to_string_pretty(&SerializedPiano {
@@ -590,7 +602,7 @@ impl eframe::App for App {
                     }
                     for (i, string) in self
                         .strings_editor
-                        .lock()
+                        .read()
                         .unwrap()
                         .iter()
                         .filter(|s| s.state.is_active)
@@ -623,7 +635,7 @@ fn measure(s: &mut PianoString, freq_detector: &FreqDetector) -> f32 {
     let samples = (0..freq_detector.sample_count)
         .map(|_| {
             s.tick();
-            s.listen()
+            s.listen_left()
         })
         .collect_vec();
 
