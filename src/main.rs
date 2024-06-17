@@ -13,8 +13,8 @@ use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
     BufferSize,
 };
-use eframe::egui::{self, CentralPanel, Color32, Grid, RichText, SidePanel, Slider, Vec2b};
-use egui_plot::{Line, Plot, PlotBounds, PlotPoints};
+use eframe::egui::{self, CentralPanel, Color32, Grid, RichText, SidePanel, Slider, Vec2b, Window};
+use egui_plot::{Arrows, Line, Plot, PlotBounds, PlotPoints};
 use itertools::Itertools;
 use midi_msg::{ChannelVoiceMsg, MidiMsg};
 use midir::MidiInput;
@@ -337,8 +337,8 @@ fn main() {
                 vis_buf: buf2,
                 locked: vec![],
                 freq_detector: FreqDetector::new(4096 * 8, sample_rate as usize),
-
                 strings_editor: strings_reader,
+                sim_string: None,
             })
         }),
     )
@@ -350,18 +350,60 @@ struct App {
     locked: Vec<f32>,
     strings_editor: Arc<Mutex<Vec<PianoString>>>,
     freq_detector: FreqDetector,
+    sim_string: Option<PianoString>,
 }
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &eframe::egui::Context, _frame: &mut eframe::Frame) {
         ctx.request_repaint();
+        if let Some(s) = &mut self.sim_string {
+            let mut open = true;
+            Window::new("Stepping string simulation")
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        if ui.button("pluck").clicked() {
+                            s.pluck(1.0, 0.3, 0.1);
+                        }
+                        if ui.button("step").clicked() {
+                            s.tick();
+                        }
+                        if ui.button("reset").clicked() {
+                            s.reset();
+                        }
+                    });
+                    Plot::new("sim string").show(ui, |ui| {
+                        let pos_iter = s
+                            .state
+                            .pos
+                            .iter()
+                            .copied()
+                            .enumerate()
+                            .map(|(i, s)| [i as f64, s as f64]);
+
+                        ui.line(Line::new(pos_iter.clone().collect::<PlotPoints>()));
+                        let vel = s
+                            .state
+                            .vel
+                            .iter()
+                            .copied()
+                            .enumerate()
+                            .zip(&s.state.pos)
+                            .map(|((i, v), p)| [i as f64, (v + *p) as f64])
+                            .collect::<PlotPoints>();
+                        ui.arrows(Arrows::new(pos_iter.clone().collect::<PlotPoints>(), vel).tip_length(10.0));
+                    });
+                });
+            if !open {
+                self.sim_string = None;
+            }
+        }
 
         SidePanel::left("strings settings").show(ctx, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 Grid::new("strings settings items")
                     .striped(true)
                     .show(ui, |ui| {
-                        // let mut strings = self.strings_editor.lock().unwrap();
                         ui.label("MIDI #");
 
                         static STOP_TUNING: AtomicBool = AtomicBool::new(true);
@@ -462,6 +504,9 @@ impl eframe::App for App {
                                 }
                                 ui.separator();
                             });
+                            if ui.button("Sim").clicked() {
+                                self.sim_string = Some(s.clone());
+                            }
                             ui.end_row();
                         }
                     })
