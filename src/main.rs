@@ -4,7 +4,7 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc::channel,
+        mpsc::{channel, Receiver, Sender},
         Arc, Mutex, RwLock,
     },
 };
@@ -18,7 +18,7 @@ use egui_plot::{Arrows, Line, Plot, PlotBounds, PlotPoints};
 use itertools::Itertools;
 use midi_msg::{ChannelVoiceMsg, MidiMsg};
 use midir::MidiInput;
-use rayon::iter::{IntoParallelRefMutIterator, ParallelIterator};
+use rayon::iter::{IntoParallelRefMutIterator, ParallelBridge, ParallelIterator};
 use rustfft::{
     num_complex::{Complex, ComplexFloat},
     Fft, FftPlanner,
@@ -27,6 +27,7 @@ use serde::{Deserialize, Serialize};
 
 const VIS_BUF_SECS: f32 = 4.0;
 const VIS_BUF_SIZE: usize = (44100.0 * VIS_BUF_SECS) as usize;
+const VIS_BUF_SLACK: usize = 44100 * 3;
 
 trait Lerp {
     fn lerp(&self, percent: f32) -> f32;
@@ -50,7 +51,7 @@ struct PianoString {
     state: StringState,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct StringState {
     current_frequency: f32,
     pos: Vec<f32>,
@@ -66,6 +67,7 @@ struct SerializedPiano {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StringConfig {
+    boost: f32,
     size: u32,
     tension: f32,
     inertia: f32,
@@ -109,14 +111,20 @@ impl PianoString {
     }
 
     fn listen_left(&self) -> f32 {
-        self.state.pos[(self.state.pos.len() as f32 * 0.2) as usize]
+        self.state.pos[(self.state.pos.len() as f32 * 0.2) as usize] * self.conf.boost
     }
+
     fn listen_right(&self) -> f32 {
-        self.state.pos[(self.state.pos.len() as f32 * 0.25) as usize]
+        self.state.pos[(self.state.pos.len() as f32 * 0.25) as usize] * self.conf.boost
+    }
+
+    fn listen_mid_unboosted(&self) -> f32 {
+        self.state.pos[self.state.pos.len() / 2]
     }
 
     /// needs to be called before plucking
-    fn resize(&mut self, new_size: usize) {
+    fn resize(&mut self) {
+        let new_size = self.conf.size as usize;
         assert!(new_size > 4);
         self.conf.size = new_size as u32;
         self.state.pos.resize(new_size, 0.0);
@@ -132,6 +140,13 @@ impl PianoString {
     }
 
     fn tick(&mut self) {
+        let substeps = 3;
+        for _ in 0..substeps {
+            self.advance();
+        }
+    }
+
+    fn advance(&mut self) {
         let st = &mut self.state;
 
         if !st.is_active {
@@ -141,7 +156,7 @@ impl PianoString {
         let mut is_now_active = false;
         let active_thresh = 0.0001;
 
-        let damping = 0.0001;
+        let damping = 0.00001;
 
         // apply velocity
         for i in 1..(st.pos.len() - 1) {
@@ -198,11 +213,9 @@ fn config_path() -> PathBuf {
         .join("riano.json")
 }
 
+const STRINGS_COUNT: usize = 128;
+
 fn main() {
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(3)
-        .build_global()
-        .unwrap();
     let (pluck_sender, pluck_receiver) = channel();
 
     let vis_buf = Arc::new(Mutex::new(VecDeque::<f32>::with_capacity(VIS_BUF_SIZE * 2)));
@@ -269,15 +282,16 @@ fn main() {
         Err(e) => {
             println!("Error loading config file: {e}");
             SerializedPiano {
-                strings: (0..128)
+                strings: (0..STRINGS_COUNT)
                     .map(|i| {
-                        let perc = i as f32 / 128.0;
+                        let perc = i as f32 / (STRINGS_COUNT - 1) as f32;
                         StringConfig {
                             tension: [2.0, 0.3].lerp(perc),
                             inertia: [10.0, 1.0].lerp(perc),
-                            elasticity: [0.1, 0.001].lerp(perc),
+                            elasticity: [0.01, 0.00001].lerp(perc),
                             size: [64, 24].lerp(perc) as u32,
                             expected_frequency: 440.0 * 2_f32.powf((i as f32 - 69.0) / 12.0),
+                            boost: 1.0,
                         }
                     })
                     .collect(),
@@ -336,11 +350,11 @@ fn main() {
                     }
                 }
 
-                // let mut vis_buf = vis_buf.lock().unwrap();
-                // vis_buf.extend(data.iter().copied());
-                // if vis_buf.len() > VIS_BUF_SIZE * 2 {
-                //     panic!("visual buf not being consumed");
-                // }
+                let mut vis_buf = vis_buf.lock().unwrap();
+                vis_buf.extend(data.iter().copied());
+                if vis_buf.len() > VIS_BUF_SIZE + VIS_BUF_SLACK {
+                    panic!("visual buf not being consumed");
+                }
             },
             |err| eprintln!("{err:?}"),
             None,
@@ -375,6 +389,8 @@ struct App {
     freq_detector: FreqDetector,
     sim_string: Option<PianoString>,
 }
+
+const BASIC_BOOST: f32 = 0.3;
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &eframe::egui::Context, _frame: &mut eframe::Frame) {
@@ -440,10 +456,8 @@ impl eframe::App for App {
                         {
                             if STOP_TUNING.load(Ordering::Relaxed) {
                                 STOP_TUNING.store(false, Ordering::Relaxed);
-                                // let strings_n = self.strings_editor.read().unwrap().len();
-                                let strings_n = 128;
 
-                                for i in 0..strings_n {
+                                for i in 0..STRINGS_COUNT {
                                     let strings = Arc::clone(&self.strings_editor);
                                     let fd = Arc::new(self.freq_detector.clone());
                                     rayon::spawn(move || {
@@ -452,10 +466,11 @@ impl eframe::App for App {
                                         }
                                         let mut s = strings.read().unwrap()[i].clone();
                                         let target_freq = s.conf.expected_frequency;
-                                        let current_freq = tune(&fd, &mut s, target_freq);
+                                        let (current_freq, level) = tune(&fd, &mut s, target_freq);
                                         let actual_s = &mut strings.write().unwrap()[i];
                                         actual_s.conf.tension = s.conf.tension;
                                         actual_s.state.current_frequency = current_freq;
+                                        actual_s.conf.boost = BASIC_BOOST / level.clamp(0.1, 10.0);
                                     });
                                 }
                             } else {
@@ -467,22 +482,24 @@ impl eframe::App for App {
                             .on_hover_text("measure all")
                             .clicked()
                         {
-                            let s_num = 128;
                             let fd = Arc::new(self.freq_detector.clone());
-                            for i in 0..s_num {
+                            for i in 0..STRINGS_COUNT {
                                 let strings = Arc::clone(&self.strings_editor);
                                 let fd = Arc::clone(&fd);
                                 rayon::spawn(move || {
                                     let mut s = { strings.read().unwrap()[i].clone() };
 
-                                    let res = measure(&mut s, &fd);
-                                    strings.write().unwrap()[i].state.current_frequency = res;
+                                    let (freq, spl) = measure(&mut s, &fd);
+                                    let s = &mut strings.write().unwrap()[i];
+                                    s.state.current_frequency = freq;
+                                    s.conf.boost = BASIC_BOOST / spl.clamp(0.1, 10.0);
                                 });
                             }
                         }
                         ui.end_row();
-                        // FIXME: write conf after the render
-                        for (i, s) in self.strings_editor.write().unwrap().iter_mut().enumerate() {
+                        let mut strings = self.strings_editor.read().unwrap().clone();
+
+                        for (i, s) in strings.iter_mut().enumerate() {
                             ui.label(RichText::new(format!("{i}")).background_color(
                                 Color32::from_rgb(
                                     if s.state.ran_away { 255 } else { 0 },
@@ -496,8 +513,10 @@ impl eframe::App for App {
                                 .clicked()
                             {
                                 let mut s2 = s.clone();
-                                s.state.current_frequency =
+                                let (freq, level) =
                                     tune(&self.freq_detector, &mut s2, s.conf.expected_frequency);
+                                s.state.current_frequency = freq;
+                                s.conf.boost = BASIC_BOOST / level.clamp(0.1, 10.0);
                                 s.conf.tension = s2.conf.tension;
                             }
                             if ui
@@ -507,7 +526,7 @@ impl eframe::App for App {
                             {
                                 let mut s_clone = s.clone();
                                 s.state.current_frequency =
-                                    measure(&mut s_clone, &self.freq_detector);
+                                    measure(&mut s_clone, &self.freq_detector).0;
                             }
                             ui.vertical(|ui| {
                                 ui.add(
@@ -525,17 +544,26 @@ impl eframe::App for App {
                                         .logarithmic(true)
                                         .text("elasticity"),
                                 );
-                                let mut size = s.conf.size;
-                                ui.add(Slider::new(&mut size, 16..=256).text("size"));
-                                if size != s.conf.size {
-                                    s.resize(size as usize);
-                                }
+
+                                ui.add(Slider::new(&mut s.conf.size, 16..=256).text("size"));
+                                ui.add(
+                                    Slider::new(&mut s.conf.boost, 0.1..=10.0)
+                                        .logarithmic(true)
+                                        .text("boost"),
+                                );
                                 ui.separator();
                             });
                             if ui.button("Sim").clicked() {
                                 self.sim_string = Some(s.clone());
                             }
                             ui.end_row();
+                        }
+                        for (real_s, new_s) in
+                            self.strings_editor.write().unwrap().iter_mut().zip(strings)
+                        {
+                            real_s.state.current_frequency = new_s.state.current_frequency;
+                            real_s.conf = new_s.conf;
+                            real_s.resize();
                         }
                     })
             });
@@ -641,21 +669,29 @@ impl eframe::App for App {
     }
 }
 
-fn measure(s: &mut PianoString, freq_detector: &FreqDetector) -> f32 {
+/// returns freq, signal level
+fn measure(s: &mut PianoString, freq_detector: &FreqDetector) -> (f32, f32) {
     s.reset();
     s.pluck(0.2, 0.5, 0.5);
     // make sure the wave propagates through
-    for _ in 0..40000 {
+    for _ in 0..20000 {
         s.tick();
     }
+
     let samples = (0..freq_detector.sample_count)
         .map(|_| {
             s.tick();
-            s.listen_left()
+            s.listen_mid_unboosted()
         })
         .collect_vec();
 
-    freq_detector.detect(&samples)
+    let signal_level = samples
+        .iter()
+        .map(|s| s.abs())
+        .max_by(|s1, s2| s1.total_cmp(s2))
+        .unwrap();
+
+    (freq_detector.detect(&samples), signal_level)
 }
 
 /// smarter frequency detection
@@ -727,11 +763,12 @@ impl FreqDetector {
 }
 
 /// clone the string to avoid strumming the live strings
-fn tune(freq_detector: &FreqDetector, s: &mut PianoString, target_freq: f32) -> f32 {
+fn tune(freq_detector: &FreqDetector, s: &mut PianoString, target_freq: f32) -> (f32, f32) {
     let mut current_freq = 0.0;
+    let mut level = 1.0;
     let mut prev_meas: Option<(f32, f32)> = None;
-    for _try in 0..100 {
-        current_freq = measure(s, freq_detector);
+    for _try in 0..200 {
+        (current_freq, level) = measure(s, freq_detector);
 
         let error = target_freq - current_freq;
         if error.abs() < target_freq * 0.005 {
@@ -757,13 +794,15 @@ fn tune(freq_detector: &FreqDetector, s: &mut PianoString, target_freq: f32) -> 
                     s.conf.tension,
                 );
 
-                corr.clamp(-(s.conf.tension * 0.1), s.conf.tension * 0.2)
+                corr.clamp(-(s.conf.tension * 0.2), s.conf.tension * 0.2)
             }
         };
         prev_meas = Some((s.conf.tension, current_freq));
-        s.conf.tension = (s.conf.tension + tension_adjust).clamp(0.001, 100.0);
+        let overshot_protection = 0.9;
+        s.conf.tension =
+            (s.conf.tension + tension_adjust * overshot_protection).clamp(0.001, 100.0);
     }
-    current_freq
+    (current_freq, level)
 }
 
 fn calc_correction(
