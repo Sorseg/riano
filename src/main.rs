@@ -373,9 +373,6 @@ impl eframe::App for App {
                             .on_hover_text("tune all")
                             .clicked()
                         {
-                            // let strings = Arc::clone(&self.strings_editor);
-                            // let fd2 = self.freq_detector.clone();
-
                             if STOP_TUNING.load(Ordering::Relaxed) {
                                 STOP_TUNING.store(false, Ordering::Relaxed);
                                 let strings_n = self.strings_editor.lock().unwrap().len();
@@ -389,26 +386,31 @@ impl eframe::App for App {
                                         }
                                         let mut s = strings.lock().unwrap()[i].clone();
                                         let target_freq = s.conf.expected_frequency;
-                                        tune(&fd, &mut s, target_freq);
-                                        strings.lock().unwrap()[i].conf.tension = s.conf.tension;
+                                        let current_freq = tune(&fd, &mut s, target_freq);
+                                        let actual_s = &mut strings.lock().unwrap()[i];
+                                        actual_s.conf.tension = s.conf.tension;
+                                        actual_s.state.current_frequency = current_freq;
                                     });
                                 }
                             } else {
                                 STOP_TUNING.store(true, Ordering::Relaxed);
                             }
-
-                            // for s in strings.iter_mut() {
-                            //     tune(&self.freq_detector, s, s.conf.expected_frequency);
-                            // }});
                         }
                         if ui
                             .label("current freq")
                             .on_hover_text("measure all")
                             .clicked()
                         {
-                            for s in self.strings_editor.lock().unwrap().iter_mut() {
-                                s.state.current_frequency =
-                                    measure(&mut s.clone(), &self.freq_detector);
+                            let s_num = self.strings_editor.lock().unwrap().len();
+                            let fd = Arc::new(self.freq_detector.clone());
+                            for i in 0..s_num {
+                                let strings = Arc::clone(&self.strings_editor);
+                                let fd = Arc::clone(&fd);
+                                rayon::spawn(move || {
+                                    let mut s = strings.lock().unwrap()[i].clone();
+                                    let res = measure(&mut s, &fd);
+                                    strings.lock().unwrap()[i].state.current_frequency = res;
+                                });
                             }
                         }
                         ui.end_row();
@@ -427,7 +429,8 @@ impl eframe::App for App {
                                 .clicked()
                             {
                                 let mut s2 = s.clone();
-                                tune(&self.freq_detector, &mut s2, s.conf.expected_frequency);
+                                s.state.current_frequency =
+                                    tune(&self.freq_detector, &mut s2, s.conf.expected_frequency);
                                 s.conf.tension = s2.conf.tension;
                             }
                             if ui
@@ -654,19 +657,20 @@ impl FreqDetector {
 }
 
 /// clone the string to avoid strumming the live strings
-fn tune(freq_detector: &FreqDetector, s: &mut PianoString, target_freq: f32) {
+fn tune(freq_detector: &FreqDetector, s: &mut PianoString, target_freq: f32) -> f32 {
+    let mut current_freq = 0.0;
     let mut prev_meas: Option<(f32, f32)> = None;
     for _try in 0..100 {
-        let current_freq = measure(s, freq_detector);
+        current_freq = measure(s, freq_detector);
 
         let error = target_freq - current_freq;
-        if error.abs() < target_freq * 0.01 {
+        if error.abs() < target_freq * 0.005 {
             println!("tuned");
-            return;
+            break;
         }
         if s.state.ran_away {
-            println!("String ran away",);
-            return;
+            println!("String ran away");
+            break;
         }
         let tension_adjust = match prev_meas {
             None => {
@@ -689,7 +693,7 @@ fn tune(freq_detector: &FreqDetector, s: &mut PianoString, target_freq: f32) {
         prev_meas = Some((s.conf.tension, current_freq));
         s.conf.tension = (s.conf.tension + tension_adjust).clamp(0.001, 100.0);
     }
-    println!("Giving up");
+    current_freq
 }
 
 fn calc_correction(
