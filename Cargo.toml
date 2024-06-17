@@ -24,6 +24,7 @@ glam = "0.28.0"
 itertools = "0.13.0"
 midi-msg = "0.7.1"
 midir = "0.10.0"
+rayon = "1.10.0"
 ringbuf = "0.4.1"
 rustfft = "6.2.0"
 serde = { version = "1.0.203", features = ["derive"] }

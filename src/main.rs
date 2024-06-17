@@ -266,9 +266,9 @@ fn main() {
                         let perc = i as f32 / 128.0;
                         StringConfig {
                             tension: [2.0, 0.3].lerp(perc),
-                            inertia: [20.0, 1.0].lerp(perc),
-                            elasticity: [0.3, 0.001].lerp(perc),
-                            size: [128, 24].lerp(perc) as u32,
+                            inertia: [10.0, 1.0].lerp(perc),
+                            elasticity: [0.1, 0.001].lerp(perc),
+                            size: [64, 24].lerp(perc) as u32,
                             expected_frequency: 440.0 * 2_f32.powf((i as f32 - 69.0) / 12.0),
                         }
                     })
@@ -364,7 +364,7 @@ impl eframe::App for App {
                 Grid::new("strings settings items")
                     .striped(true)
                     .show(ui, |ui| {
-                        let mut strings = self.strings_editor.lock().unwrap();
+                        // let mut strings = self.strings_editor.lock().unwrap();
                         ui.label("MIDI #");
 
                         static STOP_TUNING: AtomicBool = AtomicBool::new(true);
@@ -373,23 +373,26 @@ impl eframe::App for App {
                             .on_hover_text("tune all")
                             .clicked()
                         {
-                            let strings = Arc::clone(&self.strings_editor);
-                            let fd2 = self.freq_detector.clone();
+                            // let strings = Arc::clone(&self.strings_editor);
+                            // let fd2 = self.freq_detector.clone();
 
                             if STOP_TUNING.load(Ordering::Relaxed) {
                                 STOP_TUNING.store(false, Ordering::Relaxed);
-                                std::thread::spawn(move || {
-                                    let strings_count = strings.lock().unwrap().len();
-                                    for i in 0..strings_count {
+                                let strings_n = self.strings_editor.lock().unwrap().len();
+
+                                for i in 0..strings_n {
+                                    let strings = Arc::clone(&self.strings_editor);
+                                    let fd = Arc::new(self.freq_detector.clone());
+                                    rayon::spawn(move || {
                                         if STOP_TUNING.load(Ordering::Relaxed) {
                                             return;
                                         }
                                         let mut s = strings.lock().unwrap()[i].clone();
                                         let target_freq = s.conf.expected_frequency;
-                                        tune(&fd2, &mut s, target_freq);
+                                        tune(&fd, &mut s, target_freq);
                                         strings.lock().unwrap()[i].conf.tension = s.conf.tension;
-                                    }
-                                });
+                                    });
+                                }
                             } else {
                                 STOP_TUNING.store(true, Ordering::Relaxed);
                             }
@@ -403,14 +406,14 @@ impl eframe::App for App {
                             .on_hover_text("measure all")
                             .clicked()
                         {
-                            for s in strings.iter_mut() {
+                            for s in self.strings_editor.lock().unwrap().iter_mut() {
                                 s.state.current_frequency =
                                     measure(&mut s.clone(), &self.freq_detector);
                             }
                         }
                         ui.end_row();
 
-                        for (i, s) in strings.iter_mut().enumerate() {
+                        for (i, s) in self.strings_editor.lock().unwrap().iter_mut().enumerate() {
                             ui.label(RichText::new(format!("{i}")).background_color(
                                 Color32::from_rgb(
                                     if s.state.ran_away { 255 } else { 0 },
@@ -483,7 +486,7 @@ impl eframe::App for App {
                     let strings = self.strings_editor.lock().unwrap();
                     std::fs::write(
                         config_path(),
-                        serde_json::to_string(&SerializedPiano {
+                        serde_json::to_string_pretty(&SerializedPiano {
                             strings: strings.iter().map(Into::into).collect(),
                         })
                         .unwrap(),
@@ -661,11 +664,8 @@ fn tune(freq_detector: &FreqDetector, s: &mut PianoString, target_freq: f32) {
             println!("tuned");
             return;
         }
-        if error.abs() > target_freq * 2.0 {
-            println!(
-                "String is too far from tune, cur: {} targ: {}",
-                current_freq, target_freq
-            );
+        if s.state.ran_away {
+            println!("String ran away",);
             return;
         }
         let tension_adjust = match prev_meas {
