@@ -7,7 +7,6 @@ use std::{
         mpsc::channel,
         Arc, Mutex,
     },
-    time::Instant,
 };
 
 use cpal::{
@@ -282,8 +281,6 @@ fn main() {
     ));
 
     let strings_reader = Arc::clone(&strings);
-
-    let mut start = Instant::now();
 
     let stream = dev
         .build_output_stream(
