@@ -199,6 +199,10 @@ fn config_path() -> PathBuf {
 }
 
 fn main() {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(3)
+        .build_global()
+        .unwrap();
     let (pluck_sender, pluck_receiver) = channel();
 
     let vis_buf = Arc::new(Mutex::new(VecDeque::<f32>::with_capacity(VIS_BUF_SIZE * 2)));
@@ -286,47 +290,57 @@ fn main() {
     ));
 
     let strings_reader = Arc::clone(&strings);
-
+    let string_calc_pool = rayon::ThreadPoolBuilder::new().build().unwrap();
     let stream = dev
         .build_output_stream(
             &config,
             move |data: &mut [f32], _| {
                 while let Ok((string_n, vel)) = pluck_receiver.try_recv() {
-                    strings.write().unwrap()[string_n as usize].pluck(vel as f32 / 255.0, 0.3, 0.2);
-                    println!("playing string {}", string_n);
+                    {
+                        strings.write().unwrap()[string_n as usize].pluck(
+                            vel as f32 / 255.0,
+                            0.3,
+                            0.2,
+                        );
+                        println!("playing string {}", string_n);
+                    }
                 }
 
                 let buf_len = data.len();
-                let buffers = strings
-                    .write()
-                    .unwrap()
-                    .par_iter_mut()
-                    .filter(|s| s.state.is_active)
-                    .map(|s| {
-                        (0..(buf_len / 2))
-                            .flat_map(|_| {
-                                s.tick();
-                                [s.listen_left(), s.listen_right()]
+                {
+                    let buffers = string_calc_pool.install(|| {
+                        strings
+                            .write()
+                            .unwrap()
+                            .par_iter_mut()
+                            .filter(|s| s.state.is_active)
+                            .map(|s| {
+                                (0..(buf_len / 2))
+                                    .flat_map(|_| {
+                                        s.tick();
+                                        [s.listen_left(), s.listen_right()]
+                                    })
+                                    .collect_vec()
                             })
-                            .collect_vec()
-                    })
-                    .reduce(
-                        || vec![0.0; buf_len],
-                        |mut l, r| {
-                            l.iter_mut().zip(r).for_each(|(l, r)| *l += r);
-                            l
-                        },
-                    );
+                            .reduce(
+                                || vec![0.0; buf_len],
+                                |mut l, r| {
+                                    l.iter_mut().zip(r).for_each(|(l, r)| *l += r);
+                                    l
+                                },
+                            )
+                    });
 
-                for (buffer_out, buffer_calc) in data.iter_mut().zip(buffers) {
-                    *buffer_out = buffer_calc
+                    for (buffer_out, buffer_calc) in data.iter_mut().zip(buffers) {
+                        *buffer_out = buffer_calc
+                    }
                 }
 
-                let mut vis_buf = vis_buf.lock().unwrap();
-                vis_buf.extend(data.iter().copied());
-                if vis_buf.len() > VIS_BUF_SIZE * 2 {
-                    panic!("visual buf not being consumed");
-                }
+                // let mut vis_buf = vis_buf.lock().unwrap();
+                // vis_buf.extend(data.iter().copied());
+                // if vis_buf.len() > VIS_BUF_SIZE * 2 {
+                //     panic!("visual buf not being consumed");
+                // }
             },
             |err| eprintln!("{err:?}"),
             None,
@@ -426,7 +440,8 @@ impl eframe::App for App {
                         {
                             if STOP_TUNING.load(Ordering::Relaxed) {
                                 STOP_TUNING.store(false, Ordering::Relaxed);
-                                let strings_n = self.strings_editor.read().unwrap().len();
+                                // let strings_n = self.strings_editor.read().unwrap().len();
+                                let strings_n = 128;
 
                                 for i in 0..strings_n {
                                     let strings = Arc::clone(&self.strings_editor);
@@ -452,13 +467,14 @@ impl eframe::App for App {
                             .on_hover_text("measure all")
                             .clicked()
                         {
-                            let s_num = self.strings_editor.read().unwrap().len();
+                            let s_num = 128;
                             let fd = Arc::new(self.freq_detector.clone());
                             for i in 0..s_num {
                                 let strings = Arc::clone(&self.strings_editor);
                                 let fd = Arc::clone(&fd);
                                 rayon::spawn(move || {
-                                    let mut s = strings.read().unwrap()[i].clone();
+                                    let mut s = { strings.read().unwrap()[i].clone() };
+
                                     let res = measure(&mut s, &fd);
                                     strings.write().unwrap()[i].state.current_frequency = res;
                                 });
