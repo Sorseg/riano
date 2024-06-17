@@ -1,12 +1,10 @@
 use std::{
-    array,
-    cmp::Reverse,
     collections::VecDeque,
-    f32::consts::{FRAC_PI_2, TAU},
+    f32::consts::FRAC_PI_2,
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc::{channel, Sender},
+        mpsc::channel,
         Arc, Mutex,
     },
     time::Instant,
@@ -16,9 +14,7 @@ use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
     BufferSize,
 };
-use eframe::egui::{
-    self, accesskit::Node, CentralPanel, Color32, Grid, RichText, SidePanel, Slider, Vec2b,
-};
+use eframe::egui::{self, CentralPanel, Color32, Grid, RichText, SidePanel, Slider, Vec2b};
 use egui_plot::{Line, Plot, PlotBounds, PlotPoints};
 use itertools::Itertools;
 use midi_msg::{ChannelVoiceMsg, MidiMsg};
@@ -50,24 +46,26 @@ impl Lerp for [u32; 2] {
 
 #[derive(Clone)]
 struct PianoString {
-    expected_frequency: f32,
+    conf: StringConfig,
+    state: StringState,
+}
+
+#[derive(Clone)]
+struct StringState {
     current_frequency: f32,
-    ran_away: bool,
-    is_active: bool,
-    tension: f32,
-    inertia: f32,
-    elasticity: f32,
     pos: Vec<f32>,
     vel: Vec<f32>,
+    ran_away: bool,
+    is_active: bool,
 }
 
 #[derive(Serialize, Deserialize)]
 struct SerializedPiano {
-    strings: Vec<SerializedString>,
+    strings: Vec<StringConfig>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct SerializedString {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StringConfig {
     size: u32,
     tension: f32,
     inertia: f32,
@@ -75,76 +73,65 @@ struct SerializedString {
     expected_frequency: f32,
 }
 
-impl From<SerializedString> for PianoString {
-    fn from(value: SerializedString) -> Self {
-        let SerializedString {
-            size,
-            tension,
-            inertia,
-            elasticity,
-            expected_frequency,
-        } = value;
+impl From<StringConfig> for PianoString {
+    fn from(value: StringConfig) -> Self {
         PianoString {
-            expected_frequency,
-            current_frequency: 0.0,
-            ran_away: false,
-            is_active: false,
-            tension,
-            inertia,
-            elasticity,
-            pos: vec![0.0; size as usize],
-            vel: vec![0.0; size as usize],
+            state: StringState {
+                current_frequency: 0.0,
+                ran_away: false,
+                is_active: false,
+                pos: vec![0.0; value.size as usize],
+                vel: vec![0.0; value.size as usize],
+            },
+            conf: value,
         }
     }
 }
 
-impl From<&PianoString> for SerializedString {
+impl From<&PianoString> for StringConfig {
     fn from(value: &PianoString) -> Self {
-        SerializedString {
-            size: value.pos.len() as u32,
-            tension: value.tension,
-            inertia: value.inertia,
-            elasticity: value.elasticity,
-            expected_frequency: value.expected_frequency,
-        }
+        value.conf.clone()
     }
 }
 
 impl PianoString {
     fn pluck(&mut self, vel: f32, pos: f32, width: f32) {
         let vel = vel.clamp(0.0, 1.0);
-        let place_to_pluck = (self.pos.len() as f32 * pos) as usize;
-        let pluck_width = (self.pos.len() as f32 * width / 2.0) as usize;
+        let place_to_pluck = (self.state.pos.len() as f32 * pos) as usize;
+        let pluck_width = (self.state.pos.len() as f32 * width / 2.0) as usize;
         for i in (place_to_pluck - pluck_width)..=(place_to_pluck + pluck_width) {
             let distance_from_place_to_pluck = i as f32 - place_to_pluck as f32;
-            self.vel[i] =
+            self.state.vel[i] =
                 (distance_from_place_to_pluck / pluck_width as f32 * FRAC_PI_2).cos() * vel;
         }
-        self.is_active = true;
-        self.ran_away = false;
+        self.state.is_active = true;
+        self.state.ran_away = false;
     }
 
     fn listen(&self) -> f32 {
-        self.pos[4]
+        self.state.pos[(self.state.pos.len() as f32 * 0.2) as usize]
     }
 
     /// needs to be called before plucking
     fn resize(&mut self, new_size: usize) {
         assert!(new_size > 4);
-        self.pos.resize(new_size, 0.0);
-        self.vel.resize(new_size, 0.0);
+        self.conf.size = new_size as u32;
+        self.state.pos.resize(new_size, 0.0);
+        self.state.vel.resize(new_size, 0.0);
 
         // make sure the string is still attached horizontaly
         // and not flying away
-        let last = self.pos.len() - 1;
-        self.pos[last] = 0.0;
-        self.pos[last - 1] = 0.0;
-        self.vel[last] = 0.0;
-        self.vel[last - 1] = 0.0;
+        let last = self.state.pos.len() - 1;
+        self.state.pos[last] = 0.0;
+        self.state.pos[last - 1] = 0.0;
+        self.state.vel[last] = 0.0;
+        self.state.vel[last - 1] = 0.0;
     }
 
     fn tick(&mut self) {
-        if !self.is_active {
+        let st = &mut self.state;
+
+        if !st.is_active {
             return;
         }
 
@@ -154,22 +141,16 @@ impl PianoString {
         let damping = 0.0001;
 
         // apply velocity
-        for i in 1..(self.pos.len() - 1) {
-            self.pos[i] += self.vel[i] / self.inertia;
+        for i in 1..(st.pos.len() - 1) {
+            st.pos[i] += st.vel[i] / self.conf.inertia;
 
-            if self.pos[i].abs() > active_thresh {
+            if st.pos[i].abs() > active_thresh {
                 is_now_active = true;
             }
             // check for runaway
-            if self.pos[i].abs() > 1000.0 {
-                self.ran_away = true;
-                println!(
-                    "Runaway at tension {} inertia {} elasticity {}",
-                    self.tension, self.inertia, self.elasticity
-                );
-
-                // println!("{:?}", self.pos);
-                // println!("{:?}", self.vel);
+            if st.pos[i].abs() > 1000.0 {
+                st.ran_away = true;
+                println!("Runaway at {:?}", self.conf);
 
                 self.reset();
                 return;
@@ -177,33 +158,33 @@ impl PianoString {
         }
 
         // apply tension and elasticity
-        for i in 2..(self.pos.len() - 2) {
-            let straight_from_left = self.pos[i - 1] - self.pos[i - 2];
-            let left_force_target = self.pos[i - 1] + straight_from_left * 2.0;
+        for i in 2..(st.pos.len() - 2) {
+            let straight_from_left = st.pos[i - 1] - st.pos[i - 2];
+            let left_force_target = st.pos[i - 1] + straight_from_left * 2.0;
 
-            let right_vec = self.pos[i + 1] - self.pos[i + 2];
-            let right_vec_target = self.pos[i + 1] + right_vec * 2.0;
+            let right_vec = st.pos[i + 1] - st.pos[i + 2];
+            let right_vec_target = st.pos[i + 1] + right_vec * 2.0;
 
             let elastic_force_target = (left_force_target + right_vec_target) / 2.0;
-            let tension_force_target = (self.pos[i - 1] + self.pos[i + 1]) / 2.0;
+            let tension_force_target = (st.pos[i - 1] + st.pos[i + 1]) / 2.0;
 
-            let tension_force = tension_force_target - self.pos[i];
-            let elastic_force = elastic_force_target - self.pos[i];
+            let tension_force = tension_force_target - st.pos[i];
+            let elastic_force = elastic_force_target - st.pos[i];
 
-            self.vel[i] += tension_force * self.tension + elastic_force * self.elasticity;
-            self.vel[i] *= 1.0 - damping;
+            st.vel[i] += tension_force * self.conf.tension + elastic_force * self.conf.elasticity;
+            st.vel[i] *= 1.0 - damping;
 
-            if self.vel[i].abs() > active_thresh {
+            if st.vel[i].abs() > active_thresh {
                 is_now_active = true;
             }
         }
 
-        self.is_active = is_now_active;
+        st.is_active = is_now_active;
     }
 
     fn reset(&mut self) {
-        self.pos.iter_mut().for_each(|p| *p = 0.0);
-        self.vel.iter_mut().for_each(|p| *p = 0.0);
+        self.state.pos.iter_mut().for_each(|p| *p = 0.0);
+        self.state.vel.iter_mut().for_each(|p| *p = 0.0);
     }
 }
 
@@ -283,7 +264,7 @@ fn main() {
                 strings: (0..128)
                     .map(|i| {
                         let perc = i as f32 / 128.0;
-                        SerializedString {
+                        StringConfig {
                             tension: [2.0, 0.3].lerp(perc),
                             inertia: [20.0, 1.0].lerp(perc),
                             elasticity: [0.3, 0.001].lerp(perc),
@@ -313,10 +294,7 @@ fn main() {
                 while let Ok((string_n, vel)) = pluck_receiver.try_recv() {
                     let string = &mut strings[string_n as usize];
                     string.pluck(vel as f32 / 255.0, 0.3, 0.2);
-                    println!(
-                        "playing string {} tension {} inertia {} elasticity {}",
-                        string_n, string.tension, string.inertia, string.elasticity
-                    );
+                    println!("playing string {} {:?}", string_n, string.conf);
                 }
 
                 for c in data.chunks_exact_mut(2) {
@@ -325,13 +303,14 @@ fn main() {
                     // left
                     c[0] = strings
                         .iter()
-                        .filter(|s| s.is_active)
+                        .filter(|s| s.state.is_active)
                         .map(|s| s.listen())
                         .sum::<f32>();
+
                     // right
                     c[1] = strings
                         .iter()
-                        .filter(|s| s.is_active)
+                        .filter(|s| s.state.is_active)
                         .map(|s| s.listen())
                         .sum::<f32>();
                 }
@@ -406,9 +385,9 @@ impl eframe::App for App {
                                             return;
                                         }
                                         let mut s = strings.lock().unwrap()[i].clone();
-                                        let target_freq = s.expected_frequency;
+                                        let target_freq = s.conf.expected_frequency;
                                         tune(&fd2, &mut s, target_freq);
-                                        strings.lock().unwrap()[i].tension = s.tension;
+                                        strings.lock().unwrap()[i].conf.tension = s.conf.tension;
                                     }
                                 });
                             } else {
@@ -416,7 +395,7 @@ impl eframe::App for App {
                             }
 
                             // for s in strings.iter_mut() {
-                            //     tune(&self.freq_detector, s, s.expected_frequency);
+                            //     tune(&self.freq_detector, s, s.conf.expected_frequency);
                             // }});
                         }
                         if ui
@@ -425,7 +404,8 @@ impl eframe::App for App {
                             .clicked()
                         {
                             for s in strings.iter_mut() {
-                                s.current_frequency = measure(&mut s.clone(), &self.freq_detector);
+                                s.state.current_frequency =
+                                    measure(&mut s.clone(), &self.freq_detector);
                             }
                         }
                         ui.end_row();
@@ -433,48 +413,49 @@ impl eframe::App for App {
                         for (i, s) in strings.iter_mut().enumerate() {
                             ui.label(RichText::new(format!("{i}")).background_color(
                                 Color32::from_rgb(
-                                    if s.ran_away { 255 } else { 0 },
-                                    (s.pos.iter().sum::<f32>().abs() * 255.0) as u8,
+                                    if s.state.ran_away { 255 } else { 0 },
+                                    (s.state.pos.iter().sum::<f32>().abs() * 255.0) as u8,
                                     0,
                                 ),
                             ));
                             if ui
-                                .label(format!("{:.1}", s.expected_frequency))
+                                .label(format!("{:.1}", s.conf.expected_frequency))
                                 .on_hover_text("tune")
                                 .clicked()
                             {
                                 let mut s2 = s.clone();
-                                tune(&self.freq_detector, &mut s2, s.expected_frequency);
-                                s.tension = s2.tension;
+                                tune(&self.freq_detector, &mut s2, s.conf.expected_frequency);
+                                s.conf.tension = s2.conf.tension;
                             }
                             if ui
-                                .label(format!("{:.1}", s.current_frequency))
+                                .label(format!("{:.1}", s.state.current_frequency))
                                 .on_hover_text("detect")
                                 .clicked()
                             {
                                 let mut s_clone = s.clone();
-                                s.current_frequency = measure(&mut s_clone, &self.freq_detector);
+                                s.state.current_frequency =
+                                    measure(&mut s_clone, &self.freq_detector);
                             }
                             ui.vertical(|ui| {
                                 ui.add(
-                                    Slider::new(&mut s.inertia, 0.0001..=100.0)
+                                    Slider::new(&mut s.conf.inertia, 0.0001..=100.0)
                                         .logarithmic(true)
                                         .text("inertia"),
                                 );
                                 ui.add(
-                                    Slider::new(&mut s.tension, 0.0001..=100.0)
+                                    Slider::new(&mut s.conf.tension, 0.0001..=100.0)
                                         .logarithmic(true)
                                         .text("tension"),
                                 );
                                 ui.add(
-                                    Slider::new(&mut s.elasticity, 0.0001..=100.0)
+                                    Slider::new(&mut s.conf.elasticity, 0.0001..=100.0)
                                         .logarithmic(true)
                                         .text("elasticity"),
                                 );
-                                let mut size = s.pos.len();
+                                let mut size = s.conf.size;
                                 ui.add(Slider::new(&mut size, 16..=256).text("size"));
-                                if size != s.pos.len() {
-                                    s.resize(size);
+                                if size != s.conf.size {
+                                    s.resize(size as usize);
                                 }
                                 ui.separator();
                             });
@@ -559,9 +540,17 @@ impl eframe::App for App {
                     if reset_zoom {
                         ui.set_plot_bounds(PlotBounds::from_min_max([0.0, -1.0], [128.0, 1.0]))
                     }
-                    for (i, string) in self.strings_editor.lock().unwrap().iter().enumerate() {
+                    for (i, string) in self
+                        .strings_editor
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|s| s.state.is_active)
+                        .enumerate()
+                    {
                         let line = Line::new(
                             string
+                                .state
                                 .pos
                                 .iter()
                                 .enumerate()
@@ -686,14 +675,19 @@ fn tune(freq_detector: &FreqDetector, s: &mut PianoString, target_freq: f32) {
             }
             // try to predict the linear change
             Some((prev_tens, prev_freq)) => {
-                let corr =
-                    calc_correction(prev_freq, current_freq, target_freq, prev_tens, s.tension);
+                let corr = calc_correction(
+                    prev_freq,
+                    current_freq,
+                    target_freq,
+                    prev_tens,
+                    s.conf.tension,
+                );
 
-                corr.clamp(-(s.tension *0.1), s.tension * 0.2)
+                corr.clamp(-(s.conf.tension * 0.1), s.conf.tension * 0.2)
             }
         };
-        prev_meas = Some((s.tension, current_freq));
-        s.tension = (s.tension + tension_adjust).clamp(0.001, 100.0);
+        prev_meas = Some((s.conf.tension, current_freq));
+        s.conf.tension = (s.conf.tension + tension_adjust).clamp(0.001, 100.0);
     }
     println!("Giving up");
 }
@@ -732,6 +726,7 @@ fn adjust_smoke_test() {
 
 #[test]
 fn freq_detector_smoke_test() {
+    use std::f32::consts::TAU;
     let samples = 4096 * 8;
     let freq_detector = FreqDetector::new(samples, 44100);
 
@@ -741,6 +736,7 @@ fn freq_detector_smoke_test() {
                 (i as f32 / 44100.0 * freq as f32 * TAU).sin()
                 // noise
                 + (i as f32 / 100.0).sin() * 0.1
+                + (i as f32 / 120.0).sin() * 0.1
             })
             .collect_vec();
 
