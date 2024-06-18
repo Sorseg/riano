@@ -15,6 +15,7 @@ use cpal::{
 use eframe::egui::{self, CentralPanel, Color32, Grid, RichText, SidePanel, Slider, Vec2b, Window};
 use egui_plot::{Arrows, Line, Plot, PlotBounds, PlotPoints, VLine};
 
+use enterpolation::{linear::Linear, Equidistant, Generator, Identity};
 use itertools::Itertools;
 use midi_msg::{ChannelVoiceMsg, ControlChange, MidiMsg};
 use midir::MidiInput;
@@ -28,6 +29,16 @@ use serde::{Deserialize, Serialize};
 const VIS_BUF_SECS: f32 = 4.0;
 const VIS_BUF_SIZE: usize = (44100.0 * VIS_BUF_SECS) as usize;
 const VIS_BUF_SLACK: usize = 44100 * 3;
+
+const MAX_NON_LINEAR_FORCE: f32 = 0.0001;
+const CURVE_RES: usize = 1024;
+
+const STRINGS_COUNT: usize = 128;
+const LOWEST_KEY: usize = 21;
+const DAMPING_MUTED: f32 = 0.0003;
+const DAMPING_OPEN: f32 = 0.00003;
+// simulation runs this many steps per sample
+const SUB_STEPS: usize = 3;
 
 trait Lerp {
     fn lerp(&self, percent: f32) -> f32;
@@ -115,36 +126,29 @@ impl From<&Piano> for SerializedPiano {
     }
 }
 
-const MAX_SQRT_FORCE: f32 = 0.3;
-const MAX_EXPECTED_FORCE: f32 = 0.5;
-const CURVE_RES: usize = 2048;
 
-// it is clearer this way
 #[allow(clippy::needless_range_loop)]
 fn force_for_displacement(d: f32) -> f32 {
-    let scale = MAX_EXPECTED_FORCE / CURVE_RES as f32;
-    let abs_scaled = d.abs() / scale;
-    static POINTS: OnceLock<[f32; CURVE_RES]> = OnceLock::new();
-    let curve = POINTS.get_or_init(|| {
-        let mut curves = [0.0; CURVE_RES];
-        let change_point = (MAX_SQRT_FORCE / scale) as usize;
-        for i in 0..change_point {
-            curves[i] = (i as f32).sqrt() * scale * 10.0
-        }
-        let derivative = curves[change_point - 1] - curves[change_point - 2];
-        for i in change_point..curves.len() {
-            curves[i] = curves[change_point - 1] + (i - change_point) as f32 * derivative;
-        }
-        curves
-    });
+    // static POINTS: OnceLock<Linear<Equidistant<f32>, [f32; CURVE_RES], Identity>> = OnceLock::new();
 
-    let left_num = abs_scaled.floor();
-    let right_num = abs_scaled.ceil();
-    let rightness = abs_scaled - left_num;
-    let left_val = curve[(left_num as usize).clamp(0, curve.len() - 1)];
-    let right_val = curve[(right_num as usize).clamp(0, curve.len() - 1)];
+    // let curve = POINTS.get_or_init(|| {
+    //     let mut points = [0.0; CURVE_RES];
+    //     // let change_point = (MAX_SQRT_FORCE / MAX_EXPECTED_FORCE * CURVE_RES as f32) as usize;
+    //     for i in 1..CURVE_RES {
+    //         points[i] = ((i as f32 / CURVE_RES as f32 * MAX_NON_LINEAR_FORCE * 1000.0 + 0.1).powf(2.0) - 0.1.powf(2.0)) / 100.0;
+    //     }
 
-    (left_val * (1.0 - rightness) + right_val * rightness) * d.signum()
+    //     Linear::builder()
+    //         .elements(points)
+    //         .equidistant::<f32>()
+    //         .domain(0.0, MAX_NON_LINEAR_FORCE)
+    //         .build()
+    //         .unwrap()
+    // });
+
+    // curve.gen(d.abs()) * d.signum()
+
+    d
 }
 
 impl PianoString {
@@ -193,8 +197,7 @@ impl PianoString {
     }
 
     fn tick(&mut self) {
-        let substeps = 6;
-        for _ in 0..substeps {
+        for _ in 0..SUB_STEPS {
             self.advance();
         }
     }
@@ -215,7 +218,7 @@ impl PianoString {
                 is_now_active = true;
             }
             // check for runaway
-            if self.state.pos[i].abs() > 1000.0 {
+            if self.state.pos[i].abs() > 10000.0 {
                 self.state.ran_away = true;
                 println!("Runaway at {:?}", self.conf);
 
@@ -250,7 +253,7 @@ impl PianoString {
     fn calc_tens_force(&self, i: usize) -> f32 {
         let tension_force_target = (self.state.pos[i - 1] + self.state.pos[i + 1]) / 2.0;
 
-        let displacement = tension_force_target - self.state.pos[i];
+        let displacement = (tension_force_target - self.state.pos[i]).clamp(-0.01, 0.01);
         force_for_displacement(displacement * self.conf.tension)
     }
 
@@ -273,11 +276,6 @@ fn config_path() -> PathBuf {
         .config_dir()
         .join("riano.json")
 }
-
-const STRINGS_COUNT: usize = 128;
-const LOWEST_KEY: usize = 21;
-const DAMPING_MUTED: f32 = 0.0003;
-const DAMPING_OPEN: f32 = 0.00001;
 
 fn main() {
     let (midi_sender, midi_receiver) = channel();
@@ -340,10 +338,10 @@ fn main() {
                     .map(|i| {
                         let perc = i as f32 / (STRINGS_COUNT - 1) as f32;
                         StringConfig {
-                            tension: [1.0, 0.3].lerp(perc),
-                            inertia: [30.0, 10.0].lerp(perc),
-                            elasticity: [0.06, 0.0001].lerp(perc),
-                            size: [128, 32].lerp(perc) as u32,
+                            tension: [10.0, 10.0].lerp(perc),
+                            inertia: [40.0, 10.0].lerp(perc),
+                            elasticity: [1.0, 0.0001].lerp(perc),
+                            size: [256, 32].lerp(perc) as u32,
                             expected_frequency: 440.0 * 2_f32.powf((i as f32 - 69.0) / 12.0),
                             boost: 1.0,
                         }
@@ -374,7 +372,7 @@ fn main() {
                                 piano.strings[note as usize].pluck(
                                     velocity as f32 / 255.0,
                                     0.4,
-                                    0.2,
+                                    0.1,
                                 );
                             }
                             ChannelVoiceMsg::NoteOff { note, .. } => {
@@ -686,6 +684,21 @@ impl eframe::App for App {
                 }
                 reset_zoom = ui.button("reset zoom").clicked();
             });
+            if ui
+                .button(
+                    RichText::new("RESET STRINGS")
+                        .color(Color32::RED)
+                        .size(20.0),
+                )
+                .clicked()
+            {
+                self.piano
+                    .write()
+                    .unwrap()
+                    .strings
+                    .iter_mut()
+                    .for_each(|s| s.reset());
+            }
 
             Plot::new("waveform")
                 .auto_bounds(Vec2b { x: true, y: false })
@@ -730,22 +743,40 @@ impl eframe::App for App {
             Plot::new("tens curve")
                 .height(ui.available_height() / 2.0)
                 .show(ui, |ui| {
+                    let res = CURVE_RES * 2;
                     ui.line(
                         Line::new(
-                            (0..(MAX_EXPECTED_FORCE * 11.0) as usize)
+                            (0..res)
                                 .map(|i| {
                                     [
-                                        i as f64 / 10.0,
-                                        force_for_displacement(i as f32 / 10.0) as f64,
+                                        i as f64 / res as f64 * MAX_NON_LINEAR_FORCE as f64,
+                                        force_for_displacement(
+                                            i as f32 / res as f32 * MAX_NON_LINEAR_FORCE,
+                                        ) as f64,
                                     ]
                                 })
                                 .collect_vec(),
                         )
-                        .name("x"),
+                        .name("non-linear"),
+                    );
+                    ui.line(
+                        Line::new(
+                            (res..res * 2)
+                                .map(|i| {
+                                    [
+                                        i as f64 / res as f64 * MAX_NON_LINEAR_FORCE as f64,
+                                        force_for_displacement(
+                                            i as f32 / res as f32 * MAX_NON_LINEAR_FORCE,
+                                        ) as f64,
+                                    ]
+                                })
+                                .collect_vec(),
+                        )
+                        .name("linear"),
                     );
                     for s in piano_clone.strings.iter().filter(|s| s.state.is_active) {
-                        let max_force = (2..(s.conf.size - 2))
-                            .map(|i| s.calc_tens_force(i as usize).abs())
+                        let max_force = (2..(s.state.pos.len() - 2))
+                            .map(|i| s.calc_tens_force(i).abs())
                             .max_by(|f1, f2| f1.total_cmp(f2))
                             .expect("at least one point in the string");
                         ui.vline(VLine::new(max_force));
@@ -893,6 +924,7 @@ fn tune(freq_detector: &FreqDetector, s: &mut PianoString, target_freq: f32) -> 
         }
         if s.state.ran_away {
             println!("String ran away");
+            level = 5.0;
             break;
         }
         let tension_adjust = match prev_meas {
