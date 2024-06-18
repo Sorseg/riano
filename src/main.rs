@@ -1,11 +1,9 @@
 use std::{
     collections::VecDeque,
     f32::consts::FRAC_PI_2,
+    ops::Deref,
     path::PathBuf,
-    sync::{
-        mpsc::{channel},
-        Arc, Mutex, RwLock,
-    },
+    sync::{mpsc::channel, Arc, Mutex, RwLock},
 };
 
 use cpal::{
@@ -15,7 +13,7 @@ use cpal::{
 use eframe::egui::{self, CentralPanel, Color32, Grid, RichText, SidePanel, Slider, Vec2b, Window};
 use egui_plot::{Arrows, Line, Plot, PlotBounds, PlotPoints};
 use itertools::Itertools;
-use midi_msg::{ChannelVoiceMsg, MidiMsg};
+use midi_msg::{ChannelVoiceMsg, ControlChange, MidiMsg};
 use midir::MidiInput;
 use rayon::iter::{IntoParallelRefMutIterator, ParallelIterator};
 use rustfft::{
@@ -44,6 +42,11 @@ impl Lerp for [u32; 2] {
     }
 }
 
+struct Piano {
+    strings: Vec<PianoString>,
+    sustain: bool,
+}
+
 #[derive(Clone)]
 struct PianoString {
     conf: StringConfig,
@@ -53,6 +56,8 @@ struct PianoString {
 #[derive(Clone, Default)]
 struct StringState {
     damping: f32,
+    // key is pressed
+    on: bool,
     current_frequency: f32,
     pos: Vec<f32>,
     vel: Vec<f32>,
@@ -79,7 +84,8 @@ impl From<StringConfig> for PianoString {
     fn from(value: StringConfig) -> Self {
         PianoString {
             state: StringState {
-                damping: 0.00001,
+                damping: DAMPING_MUTED,
+                on: false,
                 current_frequency: 0.0,
                 ran_away: false,
                 is_active: false,
@@ -97,8 +103,18 @@ impl From<&PianoString> for StringConfig {
     }
 }
 
+impl From<&Piano> for SerializedPiano {
+    fn from(value: &Piano) -> Self {
+        SerializedPiano {
+            strings: value.strings.iter().map(Into::into).collect(),
+        }
+    }
+}
+
 impl PianoString {
     fn pluck(&mut self, vel: f32, pos: f32, width: f32) {
+        self.state.damping = DAMPING_OPEN;
+        self.state.on = true;
         let vel = vel.clamp(0.0, 1.0);
         let place_to_pluck = (self.state.pos.len() as f32 * pos) as usize;
         let pluck_width = (self.state.pos.len() as f32 * width / 2.0) as usize;
@@ -220,11 +236,11 @@ fn config_path() -> PathBuf {
 }
 
 const STRINGS_COUNT: usize = 128;
-const DAMPING_MUTED: f32 = 0.001;
+const DAMPING_MUTED: f32 = 0.003;
 const DAMPING_OPEN: f32 = 0.00001;
 
 fn main() {
-    let (pluck_sender, pluck_receiver) = channel();
+    let (midi_sender, midi_receiver) = channel();
 
     let vis_buf = Arc::new(Mutex::new(VecDeque::<f32>::with_capacity(VIS_BUF_SIZE * 2)));
     let buf2 = Arc::clone(&vis_buf);
@@ -259,14 +275,8 @@ fn main() {
             move |_t, m, _| {
                 let (m, _len) = MidiMsg::from_midi(m).unwrap();
                 if let MidiMsg::ChannelVoice { msg, .. } = m {
-                    pluck_sender.send(msg).unwrap();
+                    midi_sender.send(msg).unwrap();
                 }
-
-                if let MidiMsg::ChannelVoice {
-                    msg: ChannelVoiceMsg::NoteOff { .. },
-                    ..
-                } = m
-                {}
             },
             (),
         )
@@ -303,42 +313,65 @@ fn main() {
         }
     };
 
-    let strings: Arc<RwLock<Vec<PianoString>>> = Arc::new(RwLock::new(
-        piano_config.strings.into_iter().map(Into::into).collect(),
-    ));
+    let piano: Arc<RwLock<Piano>> = Arc::new(RwLock::new(Piano {
+        strings: piano_config.strings.into_iter().map(Into::into).collect(),
+        sustain: false,
+    }));
 
-    let strings_reader = Arc::clone(&strings);
+    let piano2 = Arc::clone(&piano);
     let string_calc_pool = rayon::ThreadPoolBuilder::new().build().unwrap();
     let stream = dev
         .build_output_stream(
             &config,
             move |data: &mut [f32], _| {
-                while let Ok(msg) = pluck_receiver.try_recv() {
+                // sustain on:
+                // ChannelVoice { channel: Ch1, msg: ControlChange { control: CC { control: 64, value: 127 } } }
+                while let Ok(msg) = midi_receiver.try_recv() {
                     {
-                        let string_n = match msg {
-                            ChannelVoiceMsg::NoteOn { note, .. } => note,
-                            ChannelVoiceMsg::NoteOff { note, .. } => note,
+                        let mut piano = piano.write().unwrap();
+                        println!("{msg:?}");
+                        match msg {
+                            ChannelVoiceMsg::NoteOn { note, velocity } => {
+                                piano.strings[note as usize].pluck(
+                                    velocity as f32 / 255.0,
+                                    0.4,
+                                    0.2,
+                                );
+                            }
+                            ChannelVoiceMsg::NoteOff { note, .. } => {
+                                let sustain = piano.sustain;
+                                let str = &mut piano.strings[note as usize];
+                                str.state.on = false;
+                                if !sustain {
+                                    str.state.damping = DAMPING_MUTED;
+                                }
+                            }
+                            ChannelVoiceMsg::ControlChange {
+                                control: ControlChange::CC { control: /* sustain */ 64, value },
+                            } => {
+                                if value > 64 {
+                                    piano.sustain = true; 
+                                } else{
+                                    piano.sustain = false;
+                                    piano.strings.iter_mut().for_each(|s| {
+                                        if !s.state.on {
+                                            s.state.damping = DAMPING_MUTED;
+                                        }
+                                    });
+                                }
+                            }
                             _ => continue,
                         };
-                        let str = &mut strings.write().unwrap()[string_n as usize];
-                        match msg {
-                            ChannelVoiceMsg::NoteOn { velocity, .. } => {
-                                println!("playing string {}", string_n);
-                                str.state.damping = DAMPING_OPEN;
-                                str.pluck(velocity as f32 / 255.0, 0.4, 0.2)
-                            }
-                            ChannelVoiceMsg::NoteOff { .. } => str.state.damping = DAMPING_MUTED,
-                            _ => {}
-                        }
                     }
                 }
 
                 let buf_len = data.len();
                 {
                     let buffers = string_calc_pool.install(|| {
-                        strings
+                        piano
                             .write()
                             .unwrap()
+                            .strings
                             .par_iter_mut()
                             .filter(|s| s.state.is_active)
                             .map(|s| {
@@ -387,7 +420,7 @@ fn main() {
                 vis_buf: buf2,
                 locked: vec![],
                 freq_detector: FreqDetector::new(4096 * 8, sample_rate as usize),
-                strings_editor: strings_reader,
+                piano: piano2,
                 sim_string: None,
             })
         }),
@@ -398,7 +431,7 @@ fn main() {
 struct App {
     vis_buf: Arc<Mutex<VecDeque<f32>>>,
     locked: Vec<f32>,
-    strings_editor: Arc<RwLock<Vec<PianoString>>>,
+    piano: Arc<RwLock<Piano>>,
     freq_detector: FreqDetector,
     sim_string: Option<PianoString>,
 }
@@ -467,13 +500,13 @@ impl eframe::App for App {
                             .clicked()
                         {
                             for i in 0..STRINGS_COUNT {
-                                let strings = Arc::clone(&self.strings_editor);
+                                let piano = Arc::clone(&self.piano);
                                 let fd = Arc::new(self.freq_detector.clone());
                                 rayon::spawn(move || {
-                                    let mut s = strings.read().unwrap()[i].ringing_clone();
+                                    let mut s = piano.read().unwrap().strings[i].ringing_clone();
                                     let target_freq = s.conf.expected_frequency;
                                     let (current_freq, level) = tune(&fd, &mut s, target_freq);
-                                    let actual_s = &mut strings.write().unwrap()[i];
+                                    let actual_s = &mut piano.write().unwrap().strings[i];
                                     actual_s.conf.tension = s.conf.tension;
                                     actual_s.state.current_frequency = current_freq;
                                     actual_s.conf.boost = BASIC_BOOST / level.clamp(0.1, 10.0);
@@ -487,22 +520,22 @@ impl eframe::App for App {
                         {
                             let fd = Arc::new(self.freq_detector.clone());
                             for i in 0..STRINGS_COUNT {
-                                let strings = Arc::clone(&self.strings_editor);
+                                let piano = Arc::clone(&self.piano);
                                 let fd = Arc::clone(&fd);
                                 rayon::spawn(move || {
-                                    let mut s = strings.read().unwrap()[i].ringing_clone();
+                                    let mut s = piano.read().unwrap().strings[i].ringing_clone();
 
                                     let (freq, spl) = measure(&mut s, &fd);
-                                    let s = &mut strings.write().unwrap()[i];
+                                    let s = &mut piano.write().unwrap().strings[i];
                                     s.state.current_frequency = freq;
                                     s.conf.boost = BASIC_BOOST / spl.clamp(0.1, 10.0);
                                 });
                             }
                         }
                         ui.end_row();
-                        let mut strings = self.strings_editor.read().unwrap().clone();
+                        let mut strings_clone = self.piano.read().unwrap().strings.clone();
 
-                        for (i, s) in strings.iter_mut().enumerate() {
+                        for (i, s) in strings_clone.iter_mut().enumerate() {
                             ui.label(RichText::new(format!("{i}")).background_color(
                                 Color32::from_rgb(
                                     if s.state.ran_away { 255 } else { 0 },
@@ -515,14 +548,14 @@ impl eframe::App for App {
                                 .on_hover_text("tune")
                                 .clicked()
                             {
-                                let strings = Arc::clone(&self.strings_editor);
+                                let piano = Arc::clone(&self.piano);
                                 let fd = self.freq_detector.clone();
                                 // FIXME: duplicate code frag with "tune all"
                                 rayon::spawn(move || {
-                                    let mut s = strings.read().unwrap()[i].ringing_clone();
+                                    let mut s = piano.read().unwrap().strings[i].ringing_clone();
                                     let target_freq = s.conf.expected_frequency;
                                     let (current_freq, level) = tune(&fd, &mut s, target_freq);
-                                    let actual_s = &mut strings.write().unwrap()[i];
+                                    let actual_s = &mut piano.write().unwrap().strings[i];
                                     actual_s.conf.tension = s.conf.tension;
                                     actual_s.state.current_frequency = current_freq;
                                     actual_s.conf.boost = BASIC_BOOST / level.clamp(0.1, 10.0);
@@ -567,8 +600,13 @@ impl eframe::App for App {
                             }
                             ui.end_row();
                         }
-                        for (real_s, new_s) in
-                            self.strings_editor.write().unwrap().iter_mut().zip(strings)
+                        for (real_s, new_s) in self
+                            .piano
+                            .write()
+                            .unwrap()
+                            .strings
+                            .iter_mut()
+                            .zip(strings_clone)
                         {
                             real_s.state.current_frequency = new_s.state.current_frequency;
                             real_s.conf = new_s.conf;
@@ -593,13 +631,11 @@ impl eframe::App for App {
                     self.locked.clear();
                 }
                 if ui.button("save").clicked() {
-                    let strings = self.strings_editor.read().unwrap();
+                    let piano = self.piano.read().unwrap();
                     std::fs::write(
                         config_path(),
-                        serde_json::to_string_pretty(&SerializedPiano {
-                            strings: strings.iter().map(Into::into).collect(),
-                        })
-                        .unwrap(),
+                        serde_json::to_string_pretty(&SerializedPiano::from(piano.deref()))
+                            .unwrap(),
                     )
                     .unwrap();
                 }
@@ -654,9 +690,10 @@ impl eframe::App for App {
                         ui.set_plot_bounds(PlotBounds::from_min_max([0.0, -1.0], [128.0, 1.0]))
                     }
                     for (i, string) in self
-                        .strings_editor
+                        .piano
                         .read()
                         .unwrap()
+                        .strings
                         .iter()
                         .filter(|s| s.state.is_active)
                         .enumerate()
