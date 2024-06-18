@@ -3,7 +3,10 @@ use std::{
     f32::consts::FRAC_PI_2,
     ops::Deref,
     path::PathBuf,
-    sync::{mpsc::channel, Arc, Mutex, RwLock},
+    sync::{
+        mpsc::{channel, Receiver, Sender},
+        Arc, Mutex, RwLock,
+    },
 };
 
 use cpal::{
@@ -236,6 +239,7 @@ fn config_path() -> PathBuf {
 }
 
 const STRINGS_COUNT: usize = 128;
+const LOWEST_KEY: usize = 21;
 const DAMPING_MUTED: f32 = 0.003;
 const DAMPING_OPEN: f32 = 0.00001;
 
@@ -421,21 +425,32 @@ fn main() {
             Box::new(App {
                 vis_buf: buf2,
                 locked: vec![],
-                freq_detector: FreqDetector::new(4096 * 8, sample_rate as usize),
+                freq_detector: Arc::new(FreqDetector::new(4096 * 8, sample_rate as usize)),
                 piano: piano2,
                 sim_string: None,
+                tune_channel: channel(),
+                freq_meas_channel: channel(),
             })
         }),
     )
     .unwrap();
 }
 
+// FIXME: channel types are gnarly,
+// replace them with a callback mechanism
+#[allow(clippy::type_complexity)]
 struct App {
     vis_buf: Arc<Mutex<VecDeque<f32>>>,
     locked: Vec<f32>,
     piano: Arc<RwLock<Piano>>,
-    freq_detector: FreqDetector,
+    freq_detector: Arc<FreqDetector>,
     sim_string: Option<PianoString>,
+
+    tune_channel: (
+        Sender<(usize, f32, f32, f32)>,
+        Receiver<(usize, f32, f32, f32)>,
+    ),
+    freq_meas_channel: (Sender<(usize, f32, f32)>, Receiver<(usize, f32, f32)>),
 }
 
 const BASIC_BOOST: f32 = 0.3;
@@ -491,6 +506,27 @@ impl eframe::App for App {
 
         SidePanel::left("strings settings").show(ctx, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
+                let tune_bg = |piano: Arc<RwLock<Piano>>, i: usize, fd: Arc<FreqDetector>| {
+                    let sender = self.tune_channel.0.clone();
+
+                    rayon::spawn(move || {
+                        let mut s = piano.read().unwrap().strings[i].ringing_clone();
+                        let target_freq = s.conf.expected_frequency;
+                        let (current_freq, level) = tune(&fd, &mut s, target_freq);
+                        sender
+                            .send((i, s.conf.tension, current_freq, level))
+                            .unwrap();
+                    })
+                };
+
+                let measure_bg = |piano: Arc<RwLock<Piano>>, i: usize, fd: Arc<FreqDetector>| {
+                    let sender = self.freq_meas_channel.0.clone();
+                    rayon::spawn(move || {
+                        let mut s = piano.read().unwrap().strings[i].ringing_clone();
+                        let (freq, spl) = measure(&mut s, &fd);
+                        sender.send((i, freq, spl)).unwrap();
+                    });
+                };
                 Grid::new("strings settings items")
                     .striped(true)
                     .show(ui, |ui| {
@@ -501,18 +537,8 @@ impl eframe::App for App {
                             .on_hover_text("tune all")
                             .clicked()
                         {
-                            for i in 0..STRINGS_COUNT {
-                                let piano = Arc::clone(&self.piano);
-                                let fd = Arc::new(self.freq_detector.clone());
-                                rayon::spawn(move || {
-                                    let mut s = piano.read().unwrap().strings[i].ringing_clone();
-                                    let target_freq = s.conf.expected_frequency;
-                                    let (current_freq, level) = tune(&fd, &mut s, target_freq);
-                                    let actual_s = &mut piano.write().unwrap().strings[i];
-                                    actual_s.conf.tension = s.conf.tension;
-                                    actual_s.state.current_frequency = current_freq;
-                                    actual_s.conf.boost = BASIC_BOOST / level.clamp(0.1, 10.0);
-                                });
+                            for i in LOWEST_KEY..STRINGS_COUNT {
+                                tune_bg(Arc::clone(&self.piano), i, self.freq_detector.clone());
                             }
                         }
                         if ui
@@ -520,24 +546,14 @@ impl eframe::App for App {
                             .on_hover_text("measure all")
                             .clicked()
                         {
-                            let fd = Arc::new(self.freq_detector.clone());
                             for i in 0..STRINGS_COUNT {
-                                let piano = Arc::clone(&self.piano);
-                                let fd = Arc::clone(&fd);
-                                rayon::spawn(move || {
-                                    let mut s = piano.read().unwrap().strings[i].ringing_clone();
-
-                                    let (freq, spl) = measure(&mut s, &fd);
-                                    let s = &mut piano.write().unwrap().strings[i];
-                                    s.state.current_frequency = freq;
-                                    s.conf.boost = BASIC_BOOST / spl.clamp(0.1, 10.0);
-                                });
+                                measure_bg(self.piano.clone(), i, self.freq_detector.clone());
                             }
                         }
                         ui.end_row();
                         let mut strings_clone = self.piano.read().unwrap().strings.clone();
 
-                        for (i, s) in strings_clone.iter_mut().enumerate() {
+                        for (i, s) in strings_clone.iter_mut().enumerate().skip(LOWEST_KEY) {
                             ui.label(RichText::new(format!("{i}")).background_color(
                                 Color32::from_rgb(
                                     if s.state.ran_away { 255 } else { 0 },
@@ -550,27 +566,14 @@ impl eframe::App for App {
                                 .on_hover_text("tune")
                                 .clicked()
                             {
-                                let piano = Arc::clone(&self.piano);
-                                let fd = self.freq_detector.clone();
-                                // FIXME: duplicate code frag with "tune all"
-                                rayon::spawn(move || {
-                                    let mut s = piano.read().unwrap().strings[i].ringing_clone();
-                                    let target_freq = s.conf.expected_frequency;
-                                    let (current_freq, level) = tune(&fd, &mut s, target_freq);
-                                    let actual_s = &mut piano.write().unwrap().strings[i];
-                                    actual_s.conf.tension = s.conf.tension;
-                                    actual_s.state.current_frequency = current_freq;
-                                    actual_s.conf.boost = BASIC_BOOST / level.clamp(0.1, 10.0);
-                                });
+                                tune_bg(self.piano.clone(), i, self.freq_detector.clone());
                             }
                             if ui
                                 .label(format!("{:.1}", s.state.current_frequency))
-                                .on_hover_text("detect")
+                                .on_hover_text("measure")
                                 .clicked()
                             {
-                                s.state.current_frequency =
-                                    measure(&mut s.ringing_clone(), &self.freq_detector).0;
-                                println!("{}", s.state.current_frequency);
+                                measure_bg(self.piano.clone(), i, self.freq_detector.clone());
                             }
                             ui.vertical(|ui| {
                                 ui.add(
@@ -602,17 +605,22 @@ impl eframe::App for App {
                             }
                             ui.end_row();
                         }
-                        for (real_s, new_s) in self
-                            .piano
-                            .write()
-                            .unwrap()
-                            .strings
-                            .iter_mut()
-                            .zip(strings_clone)
-                        {
+                        let mut real_piano = self.piano.write().unwrap();
+                        for (real_s, new_s) in real_piano.strings.iter_mut().zip(strings_clone) {
                             real_s.state.current_frequency = new_s.state.current_frequency;
                             real_s.conf = new_s.conf;
                             real_s.resize();
+                        }
+                        while let Ok((i, freq, level)) = self.freq_meas_channel.1.try_recv() {
+                            let s = &mut real_piano.strings[i];
+                            s.state.current_frequency = freq;
+                            s.conf.boost = BASIC_BOOST / level.clamp(0.01, 100.0)
+                        }
+                        while let Ok((i, tens, freq, level)) = self.tune_channel.1.try_recv() {
+                            let s = &mut real_piano.strings[i];
+                            s.conf.tension = tens;
+                            s.state.current_frequency = freq;
+                            s.conf.boost = BASIC_BOOST / level.clamp(0.01, 100.0)
                         }
                     })
             });
