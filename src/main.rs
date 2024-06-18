@@ -240,7 +240,7 @@ fn config_path() -> PathBuf {
 
 const STRINGS_COUNT: usize = 128;
 const LOWEST_KEY: usize = 21;
-const DAMPING_MUTED: f32 = 0.003;
+const DAMPING_MUTED: f32 = 0.0003;
 const DAMPING_OPEN: f32 = 0.00001;
 
 fn main() {
