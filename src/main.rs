@@ -330,6 +330,7 @@ fn main() {
                     {
                         let mut piano = piano.write().unwrap();
                         println!("{msg:?}");
+
                         match msg {
                             ChannelVoiceMsg::NoteOn { note, velocity } => {
                                 piano.strings[note as usize].pluck(
@@ -347,11 +348,12 @@ fn main() {
                                 }
                             }
                             ChannelVoiceMsg::ControlChange {
-                                control: ControlChange::CC { control: /* sustain */ 64, value },
+                                // 64 is sustain
+                                control: ControlChange::CC { control: 64, value },
                             } => {
                                 if value > 64 {
-                                    piano.sustain = true; 
-                                } else{
+                                    piano.sustain = true;
+                                } else {
                                     piano.sustain = false;
                                     piano.strings.iter_mut().for_each(|s| {
                                         if !s.state.on {
