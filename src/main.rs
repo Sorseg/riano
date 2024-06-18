@@ -443,7 +443,7 @@ struct App {
     locked: Vec<f32>,
     piano: Arc<RwLock<Piano>>,
     freq_detector: Arc<FreqDetector>,
-    sim_string: Option<PianoString>,
+    sim_string: Option<(PianoString, bool)>,
 
     tune_channel: (
         Sender<(usize, f32, f32, f32)>,
@@ -457,7 +457,7 @@ const BASIC_BOOST: f32 = 0.3;
 impl eframe::App for App {
     fn update(&mut self, ctx: &eframe::egui::Context, _frame: &mut eframe::Frame) {
         ctx.request_repaint();
-        if let Some(s) = &mut self.sim_string {
+        if let Some((s, run)) = &mut self.sim_string {
             let mut open = true;
             Window::new("Stepping string simulation")
                 .open(&mut open)
@@ -466,12 +466,13 @@ impl eframe::App for App {
                         if ui.button("pluck").clicked() {
                             s.pluck(1.0, 0.3, 0.1);
                         }
-                        if ui.button("step").clicked() {
+                        if ui.button("step").clicked() || *run {
                             s.tick();
                         }
                         if ui.button("reset").clicked() {
                             s.reset();
                         }
+                        ui.checkbox(run, "run");
                     });
                     Plot::new("sim string").show(ui, |ui| {
                         let pos_iter = s
@@ -530,26 +531,22 @@ impl eframe::App for App {
                     .striped(true)
                     .show(ui, |ui| {
                         ui.label("MIDI #");
-
-                        if ui
-                            .label("expected freq")
-                            .on_hover_text("tune all")
-                            .clicked()
-                        {
-                            for i in LOWEST_KEY..STRINGS_COUNT {
-                                tune_bg(Arc::clone(&self.piano), i, self.freq_detector.clone());
+                        ui.label("expected freq");
+                        ui.label("current freq");
+                        ui.group(|ui| {
+                            if ui.button("tune all").clicked() {
+                                for i in LOWEST_KEY..STRINGS_COUNT {
+                                    tune_bg(Arc::clone(&self.piano), i, self.freq_detector.clone());
+                                }
                             }
-                        }
-                        if ui
-                            .label("current freq")
-                            .on_hover_text("measure all")
-                            .clicked()
-                        {
-                            for i in 0..STRINGS_COUNT {
-                                measure_bg(self.piano.clone(), i, self.freq_detector.clone());
+                            if ui.button("measure all").clicked() {
+                                for i in 0..STRINGS_COUNT {
+                                    measure_bg(self.piano.clone(), i, self.freq_detector.clone());
+                                }
                             }
-                        }
+                        });
                         ui.end_row();
+
                         let mut strings_clone = self.piano.read().unwrap().strings.clone();
 
                         for (i, s) in strings_clone.iter_mut().enumerate().skip(LOWEST_KEY) {
@@ -600,7 +597,9 @@ impl eframe::App for App {
                                 ui.separator();
                             });
                             if ui.button("Sim").clicked() {
-                                self.sim_string = Some(s.ringing_clone());
+                                let mut s = s.clone();
+                                s.state.damping = DAMPING_OPEN;
+                                self.sim_string = Some((s, false));
                             }
                             ui.end_row();
                         }
