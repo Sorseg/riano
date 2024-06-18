@@ -3,8 +3,7 @@ use std::{
     f32::consts::FRAC_PI_2,
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, Ordering},
-        mpsc::{channel, Receiver, Sender},
+        mpsc::{channel},
         Arc, Mutex, RwLock,
     },
 };
@@ -18,7 +17,7 @@ use egui_plot::{Arrows, Line, Plot, PlotBounds, PlotPoints};
 use itertools::Itertools;
 use midi_msg::{ChannelVoiceMsg, MidiMsg};
 use midir::MidiInput;
-use rayon::iter::{IntoParallelRefMutIterator, ParallelBridge, ParallelIterator};
+use rayon::iter::{IntoParallelRefMutIterator, ParallelIterator};
 use rustfft::{
     num_complex::{Complex, ComplexFloat},
     Fft, FftPlanner,
@@ -53,6 +52,7 @@ struct PianoString {
 
 #[derive(Clone, Default)]
 struct StringState {
+    damping: f32,
     current_frequency: f32,
     pos: Vec<f32>,
     vel: Vec<f32>,
@@ -79,6 +79,7 @@ impl From<StringConfig> for PianoString {
     fn from(value: StringConfig) -> Self {
         PianoString {
             state: StringState {
+                damping: 0.00001,
                 current_frequency: 0.0,
                 ran_away: false,
                 is_active: false,
@@ -140,7 +141,7 @@ impl PianoString {
     }
 
     fn tick(&mut self) {
-        let substeps = 3;
+        let substeps = 6;
         for _ in 0..substeps {
             self.advance();
         }
@@ -155,8 +156,6 @@ impl PianoString {
 
         let mut is_now_active = false;
         let active_thresh = 0.0001;
-
-        let damping = 0.00001;
 
         // apply velocity
         for i in 1..(st.pos.len() - 1) {
@@ -190,7 +189,7 @@ impl PianoString {
             let elastic_force = elastic_force_target - st.pos[i];
 
             st.vel[i] += tension_force * self.conf.tension + elastic_force * self.conf.elasticity;
-            st.vel[i] *= 1.0 - damping;
+            st.vel[i] *= 1.0 - st.damping;
 
             if st.vel[i].abs() > active_thresh {
                 is_now_active = true;
@@ -204,6 +203,13 @@ impl PianoString {
         self.state.pos.iter_mut().for_each(|p| *p = 0.0);
         self.state.vel.iter_mut().for_each(|p| *p = 0.0);
     }
+
+    fn ringing_clone(&self) -> Self {
+        let mut clone = self.clone();
+        clone.state.damping = DAMPING_OPEN;
+        clone.reset();
+        clone
+    }
 }
 
 fn config_path() -> PathBuf {
@@ -214,6 +220,8 @@ fn config_path() -> PathBuf {
 }
 
 const STRINGS_COUNT: usize = 128;
+const DAMPING_MUTED: f32 = 0.001;
+const DAMPING_OPEN: f32 = 0.00001;
 
 fn main() {
     let (pluck_sender, pluck_receiver) = channel();
@@ -250,12 +258,8 @@ fn main() {
             "reading midi",
             move |_t, m, _| {
                 let (m, _len) = MidiMsg::from_midi(m).unwrap();
-                if let MidiMsg::ChannelVoice {
-                    msg: ChannelVoiceMsg::NoteOn { velocity, note },
-                    ..
-                } = m
-                {
-                    pluck_sender.send((note, velocity)).unwrap();
+                if let MidiMsg::ChannelVoice { msg, .. } = m {
+                    pluck_sender.send(msg).unwrap();
                 }
 
                 if let MidiMsg::ChannelVoice {
@@ -287,9 +291,9 @@ fn main() {
                         let perc = i as f32 / (STRINGS_COUNT - 1) as f32;
                         StringConfig {
                             tension: [2.0, 0.3].lerp(perc),
-                            inertia: [10.0, 1.0].lerp(perc),
-                            elasticity: [0.01, 0.00001].lerp(perc),
-                            size: [64, 24].lerp(perc) as u32,
+                            inertia: [30.0, 4.0].lerp(perc),
+                            elasticity: [0.06, 0.00001].lerp(perc),
+                            size: [128, 32].lerp(perc) as u32,
                             expected_frequency: 440.0 * 2_f32.powf((i as f32 - 69.0) / 12.0),
                             boost: 1.0,
                         }
@@ -309,14 +313,23 @@ fn main() {
         .build_output_stream(
             &config,
             move |data: &mut [f32], _| {
-                while let Ok((string_n, vel)) = pluck_receiver.try_recv() {
+                while let Ok(msg) = pluck_receiver.try_recv() {
                     {
-                        strings.write().unwrap()[string_n as usize].pluck(
-                            vel as f32 / 255.0,
-                            0.3,
-                            0.2,
-                        );
-                        println!("playing string {}", string_n);
+                        let string_n = match msg {
+                            ChannelVoiceMsg::NoteOn { note, .. } => note,
+                            ChannelVoiceMsg::NoteOff { note, .. } => note,
+                            _ => continue,
+                        };
+                        let str = &mut strings.write().unwrap()[string_n as usize];
+                        match msg {
+                            ChannelVoiceMsg::NoteOn { velocity, .. } => {
+                                println!("playing string {}", string_n);
+                                str.state.damping = DAMPING_OPEN;
+                                str.pluck(velocity as f32 / 255.0, 0.4, 0.2)
+                            }
+                            ChannelVoiceMsg::NoteOff { .. } => str.state.damping = DAMPING_MUTED,
+                            _ => {}
+                        }
                     }
                 }
 
@@ -448,33 +461,23 @@ impl eframe::App for App {
                     .show(ui, |ui| {
                         ui.label("MIDI #");
 
-                        static STOP_TUNING: AtomicBool = AtomicBool::new(true);
                         if ui
                             .label("expected freq")
                             .on_hover_text("tune all")
                             .clicked()
                         {
-                            if STOP_TUNING.load(Ordering::Relaxed) {
-                                STOP_TUNING.store(false, Ordering::Relaxed);
-
-                                for i in 0..STRINGS_COUNT {
-                                    let strings = Arc::clone(&self.strings_editor);
-                                    let fd = Arc::new(self.freq_detector.clone());
-                                    rayon::spawn(move || {
-                                        if STOP_TUNING.load(Ordering::Relaxed) {
-                                            return;
-                                        }
-                                        let mut s = strings.read().unwrap()[i].clone();
-                                        let target_freq = s.conf.expected_frequency;
-                                        let (current_freq, level) = tune(&fd, &mut s, target_freq);
-                                        let actual_s = &mut strings.write().unwrap()[i];
-                                        actual_s.conf.tension = s.conf.tension;
-                                        actual_s.state.current_frequency = current_freq;
-                                        actual_s.conf.boost = BASIC_BOOST / level.clamp(0.1, 10.0);
-                                    });
-                                }
-                            } else {
-                                STOP_TUNING.store(true, Ordering::Relaxed);
+                            for i in 0..STRINGS_COUNT {
+                                let strings = Arc::clone(&self.strings_editor);
+                                let fd = Arc::new(self.freq_detector.clone());
+                                rayon::spawn(move || {
+                                    let mut s = strings.read().unwrap()[i].ringing_clone();
+                                    let target_freq = s.conf.expected_frequency;
+                                    let (current_freq, level) = tune(&fd, &mut s, target_freq);
+                                    let actual_s = &mut strings.write().unwrap()[i];
+                                    actual_s.conf.tension = s.conf.tension;
+                                    actual_s.state.current_frequency = current_freq;
+                                    actual_s.conf.boost = BASIC_BOOST / level.clamp(0.1, 10.0);
+                                });
                             }
                         }
                         if ui
@@ -487,7 +490,7 @@ impl eframe::App for App {
                                 let strings = Arc::clone(&self.strings_editor);
                                 let fd = Arc::clone(&fd);
                                 rayon::spawn(move || {
-                                    let mut s = { strings.read().unwrap()[i].clone() };
+                                    let mut s = strings.read().unwrap()[i].ringing_clone();
 
                                     let (freq, spl) = measure(&mut s, &fd);
                                     let s = &mut strings.write().unwrap()[i];
@@ -512,21 +515,27 @@ impl eframe::App for App {
                                 .on_hover_text("tune")
                                 .clicked()
                             {
-                                let mut s2 = s.clone();
-                                let (freq, level) =
-                                    tune(&self.freq_detector, &mut s2, s.conf.expected_frequency);
-                                s.state.current_frequency = freq;
-                                s.conf.boost = BASIC_BOOST / level.clamp(0.1, 10.0);
-                                s.conf.tension = s2.conf.tension;
+                                let strings = Arc::clone(&self.strings_editor);
+                                let fd = self.freq_detector.clone();
+                                // FIXME: duplicate code frag with "tune all"
+                                rayon::spawn(move || {
+                                    let mut s = strings.read().unwrap()[i].ringing_clone();
+                                    let target_freq = s.conf.expected_frequency;
+                                    let (current_freq, level) = tune(&fd, &mut s, target_freq);
+                                    let actual_s = &mut strings.write().unwrap()[i];
+                                    actual_s.conf.tension = s.conf.tension;
+                                    actual_s.state.current_frequency = current_freq;
+                                    actual_s.conf.boost = BASIC_BOOST / level.clamp(0.1, 10.0);
+                                });
                             }
                             if ui
                                 .label(format!("{:.1}", s.state.current_frequency))
                                 .on_hover_text("detect")
                                 .clicked()
                             {
-                                let mut s_clone = s.clone();
                                 s.state.current_frequency =
-                                    measure(&mut s_clone, &self.freq_detector).0;
+                                    measure(&mut s.ringing_clone(), &self.freq_detector).0;
+                                println!("{}", s.state.current_frequency);
                             }
                             ui.vertical(|ui| {
                                 ui.add(
@@ -554,7 +563,7 @@ impl eframe::App for App {
                                 ui.separator();
                             });
                             if ui.button("Sim").clicked() {
-                                self.sim_string = Some(s.clone());
+                                self.sim_string = Some(s.ringing_clone());
                             }
                             ui.end_row();
                         }
@@ -658,7 +667,7 @@ impl eframe::App for App {
                                 .pos
                                 .iter()
                                 .enumerate()
-                                .map(|(i, v)| [i as f64, *v as f64])
+                                .map(|(i, v)| [i as f64, *v as f64 * string.conf.boost as f64])
                                 .collect::<PlotPoints>(),
                         )
                         .name(&format!("string {i}"));
@@ -672,7 +681,7 @@ impl eframe::App for App {
 /// returns freq, signal level
 fn measure(s: &mut PianoString, freq_detector: &FreqDetector) -> (f32, f32) {
     s.reset();
-    s.pluck(0.2, 0.5, 0.5);
+    s.pluck(0.3, 0.5, 0.6);
     // make sure the wave propagates through
     for _ in 0..20000 {
         s.tick();
