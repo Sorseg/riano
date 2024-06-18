@@ -57,6 +57,8 @@ impl Lerp for [u32; 2] {
 struct Piano {
     strings: Vec<PianoString>,
     sustain: bool,
+    pluck_force: f32,
+    vocoder_level: f32,
 }
 
 #[derive(Clone)]
@@ -68,13 +70,16 @@ struct PianoString {
 #[derive(Clone, Default)]
 struct StringState {
     damping: f32,
-    // key is pressed
+    /// key is pressed
     on: bool,
+    /// damper is removed by a key or by a sustain pedal
+    is_active: bool,
+    /// will be simulated
+    is_ringing: bool,
     current_frequency: f32,
     pos: Vec<f32>,
     vel: Vec<f32>,
     ran_away: bool,
-    is_active: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -98,9 +103,10 @@ impl From<StringConfig> for PianoString {
             state: StringState {
                 damping: DAMPING_MUTED,
                 on: false,
+                is_active: false,
+                is_ringing: false,
                 current_frequency: 0.0,
                 ran_away: false,
-                is_active: false,
                 pos: vec![0.0; value.size as usize],
                 vel: vec![0.0; value.size as usize],
             },
@@ -154,6 +160,10 @@ impl PianoString {
     fn pluck(&mut self, vel: f32, pos: f32, width: f32) {
         self.state.damping = DAMPING_OPEN;
         self.state.on = true;
+        self.state.is_active = true;
+        self.state.is_ringing = true;
+        self.state.ran_away = false;
+
         let vel = vel.clamp(0.0, 1.0);
         let place_to_pluck = (self.state.pos.len() as f32 * pos) as usize;
         let pluck_width = (self.state.pos.len() as f32 * width / 2.0) as usize;
@@ -162,8 +172,6 @@ impl PianoString {
             self.state.vel[i] =
                 (distance_from_place_to_pluck / pluck_width as f32 * FRAC_PI_2).cos() * vel;
         }
-        self.state.is_active = true;
-        self.state.ran_away = false;
     }
 
     fn listen_left(&self) -> f32 {
@@ -196,20 +204,22 @@ impl PianoString {
     }
 
     fn apply_pressure(&mut self, p: f32) {
-        self.state.vel[4] += p;
+        self.state.vel[8] += p;
     }
 
-    fn tick(&mut self) {
-        for _ in 0..SUB_STEPS {
-            self.advance();
-        }
-    }
-
-    fn advance(&mut self) {
-        if !self.state.is_active {
+    fn tick(&mut self, sustain: bool) {
+        if !self.state.is_ringing {
             return;
         }
+        if !sustain && !self.state.on {
+            self.state.is_active = false;
+        }
+        for _ in 0..SUB_STEPS {
+            self.advance(sustain);
+        }
+    }
 
+    fn advance(&mut self, sustain: bool) {
         let mut is_now_active = false;
         let active_thresh = 0.0001;
 
@@ -251,7 +261,7 @@ impl PianoString {
             }
         }
 
-        self.state.is_active = is_now_active || self.state.on;
+        self.state.is_ringing = is_now_active || self.state.on || sustain;
     }
 
     fn calc_tens_force(&self, i: usize) -> f32 {
@@ -408,6 +418,8 @@ fn main() {
     let piano: Arc<RwLock<Piano>> = Arc::new(RwLock::new(Piano {
         strings: piano_config.strings.into_iter().map(Into::into).collect(),
         sustain: false,
+        pluck_force: 1.0,
+        vocoder_level: 0.0,
     }));
 
     let piano2 = Arc::clone(&piano);
@@ -420,12 +432,13 @@ fn main() {
                 while let Ok(msg) = midi_receiver.try_recv() {
                     {
                         let mut piano = piano.write().unwrap();
+                        let pluck_force = piano.pluck_force;
                         println!("{msg:?}");
 
                         match msg {
                             ChannelVoiceMsg::NoteOn { note, velocity } => {
                                 piano.strings[note as usize].pluck(
-                                    velocity as f32 / 255.0 / 10.0,
+                                    velocity as f32 / 255.0 * pluck_force,
                                     0.4,
                                     0.3,
                                 );
@@ -466,20 +479,23 @@ fn main() {
 
                 {
                     let buffers = string_calc_pool.install(|| {
+                        let mut piano = piano.write().unwrap();
+                        let vocoder_lever = piano.vocoder_level;
+                        let sustain = piano.sustain;
                         piano
-                            .write()
-                            .unwrap()
                             .strings
                             .iter_mut()
-                            .filter(|s| s.state.is_active)
+                            .filter(|s| s.state.is_ringing)
                             .par_bridge()
                             .map(|s| {
                                 (0..(buf_len / 2))
                                     .flat_map(|i| {
-                                        if s.state.on {
-                                            s.apply_pressure(record_listener_buffer[i]);
+                                        if s.state.is_active {
+                                            s.apply_pressure(
+                                                record_listener_buffer[i] * vocoder_lever,
+                                            );
                                         }
-                                        s.tick();
+                                        s.tick(sustain);
                                         [s.listen_left(), s.listen_right()]
                                     })
                                     .collect_vec()
@@ -521,7 +537,7 @@ fn main() {
             Box::new(App {
                 vis_buf: buf2,
                 locked: vec![],
-                freq_detector: Arc::new(FreqDetector::new(4096 * 8, sample_rate as usize)),
+                freq_detector: Arc::new(FreqDetector::new(4096 * 2, sample_rate as usize)),
                 piano: piano2,
                 sim_string: None,
                 tune_channel: channel(),
@@ -564,7 +580,7 @@ impl eframe::App for App {
                             s.pluck(1.0, 0.3, 0.1);
                         }
                         if ui.button("step").clicked() || *run {
-                            s.tick();
+                            s.tick(false);
                         }
                         if ui.button("reset").clicked() {
                             s.reset();
@@ -701,25 +717,6 @@ impl eframe::App for App {
                             }
                             ui.end_row();
                         }
-                        let mut real_piano = self.piano.write().unwrap();
-                        for (real_s, new_s) in
-                            real_piano.strings.iter_mut().zip(&piano_clone.strings)
-                        {
-                            real_s.state.current_frequency = new_s.state.current_frequency;
-                            real_s.conf = new_s.conf.clone();
-                            real_s.resize();
-                        }
-                        while let Ok((i, freq, level)) = self.freq_meas_channel.1.try_recv() {
-                            let s = &mut real_piano.strings[i];
-                            s.state.current_frequency = freq;
-                            s.conf.boost = BASIC_BOOST / level.clamp(0.01, 100.0)
-                        }
-                        while let Ok((i, tens, freq, level)) = self.tune_channel.1.try_recv() {
-                            let s = &mut real_piano.strings[i];
-                            s.conf.tension = tens;
-                            s.state.current_frequency = freq;
-                            s.conf.boost = BASIC_BOOST / level.clamp(0.01, 100.0)
-                        }
                     })
             });
         });
@@ -762,6 +759,8 @@ impl eframe::App for App {
                     .iter_mut()
                     .for_each(|s| s.reset());
             }
+            ui.add(Slider::new(&mut piano_clone.pluck_force, 0.0..=10.0).text("pluck force"));
+            ui.add(Slider::new(&mut piano_clone.vocoder_level, 0.0..=10.0).text("vocoder"));
 
             Plot::new("waveform")
                 .auto_bounds(Vec2b { x: true, y: false })
@@ -810,13 +809,10 @@ impl eframe::App for App {
                     if reset_zoom {
                         ui.set_plot_bounds(PlotBounds::from_min_max([0.0, -1.0], [128.0, 1.0]))
                     }
-                    for (i, string) in self
-                        .piano
-                        .read()
-                        .unwrap()
+                    for (i, string) in piano_clone
                         .strings
                         .iter()
-                        .filter(|s| s.state.is_active)
+                        .filter(|s| s.state.is_ringing)
                         .enumerate()
                     {
                         let line = Line::new(
@@ -833,6 +829,29 @@ impl eframe::App for App {
                     }
                 });
         });
+
+        let mut real_piano = self.piano.write().unwrap();
+        real_piano.pluck_force = piano_clone.pluck_force;
+        real_piano.vocoder_level = piano_clone.vocoder_level;
+
+        for (real_s, new_s) in real_piano.strings.iter_mut().zip(&piano_clone.strings) {
+            real_s.state.current_frequency = new_s.state.current_frequency;
+            real_s.conf = new_s.conf.clone();
+            real_s.resize();
+        }
+
+        while let Ok((i, freq, level)) = self.freq_meas_channel.1.try_recv() {
+            let s = &mut real_piano.strings[i];
+            s.state.current_frequency = freq;
+            s.conf.boost = BASIC_BOOST / level.clamp(0.01, 100.0)
+        }
+
+        while let Ok((i, tens, freq, level)) = self.tune_channel.1.try_recv() {
+            let s = &mut real_piano.strings[i];
+            s.conf.tension = tens;
+            s.state.current_frequency = freq;
+            s.conf.boost = BASIC_BOOST / level.clamp(0.01, 100.0)
+        }
     }
 }
 
@@ -842,12 +861,12 @@ fn measure(s: &mut PianoString, freq_detector: &FreqDetector) -> (f32, f32) {
     s.pluck(0.3, 0.5, 0.6);
     // make sure the wave propagates through
     for _ in 0..20000 {
-        s.tick();
+        s.tick(false);
     }
 
     let samples = (0..freq_detector.sample_count)
         .map(|_| {
-            s.tick();
+            s.tick(false);
             s.listen_mid_unboosted()
         })
         .collect_vec();
@@ -931,14 +950,16 @@ impl FreqDetector {
 
 /// clone the string to avoid strumming the live strings
 fn tune(freq_detector: &FreqDetector, s: &mut PianoString, target_freq: f32) -> (f32, f32) {
+    let mut clamp = 0.2;
     let mut current_freq = 0.0;
     let mut level = 1.0;
     let mut prev_meas: Option<(f32, f32)> = None;
-    for _try in 0..200 {
+    let tries = 200;
+    for _try in 0..tries {
         (current_freq, level) = measure(s, freq_detector);
 
         let error = target_freq - current_freq;
-        if error.abs() < target_freq * 0.005 {
+        if error.abs() < target_freq * 0.003 {
             println!("tuned");
             break;
         }
@@ -962,7 +983,9 @@ fn tune(freq_detector: &FreqDetector, s: &mut PianoString, target_freq: f32) -> 
                     s.conf.tension,
                 );
 
-                corr.clamp(-(s.conf.tension * 0.2), s.conf.tension * 0.2)
+                let res = corr.clamp(-(s.conf.tension * clamp), s.conf.tension * clamp);
+                clamp /= 1.05;
+                res
             }
         };
         prev_meas = Some((s.conf.tension, current_freq));
@@ -1007,10 +1030,10 @@ fn adjust_smoke_test() {
 #[test]
 fn freq_detector_smoke_test() {
     use std::f32::consts::TAU;
-    let samples = 4096 * 8;
+    let samples = 4096 * 4;
     let freq_detector = FreqDetector::new(samples, 44100);
 
-    for freq in [10, 100, 1000, 2000] {
+    for freq in [10, 20, 30, 100, 1000, 2000] {
         let sin_samples = (0..samples)
             .map(|i| {
                 (i as f32 / 44100.0 * freq as f32 * TAU).sin()
@@ -1027,4 +1050,5 @@ fn freq_detector_smoke_test() {
             "detected {detected_freq} expected {freq}"
         );
     }
+    panic!("")
 }
