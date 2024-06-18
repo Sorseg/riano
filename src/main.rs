@@ -126,7 +126,6 @@ impl From<&Piano> for SerializedPiano {
     }
 }
 
-
 #[allow(clippy::needless_range_loop)]
 fn force_for_displacement(d: f32) -> f32 {
     // static POINTS: OnceLock<Linear<Equidistant<f32>, [f32; CURVE_RES], Identity>> = OnceLock::new();
@@ -218,7 +217,7 @@ impl PianoString {
                 is_now_active = true;
             }
             // check for runaway
-            if self.state.pos[i].abs() > 10000.0 {
+            if self.state.pos[i].abs() > 1000.0 {
                 self.state.ran_away = true;
                 println!("Runaway at {:?}", self.conf);
 
@@ -333,21 +332,53 @@ fn main() {
         Ok(s) => serde_json::from_str(&s).unwrap(),
         Err(e) => {
             println!("Error loading piano file: {e}");
-            SerializedPiano {
-                strings: (0..STRINGS_COUNT)
-                    .map(|i| {
-                        let perc = i as f32 / (STRINGS_COUNT - 1) as f32;
-                        StringConfig {
-                            tension: [10.0, 10.0].lerp(perc),
-                            inertia: [40.0, 10.0].lerp(perc),
-                            elasticity: [1.0, 0.0001].lerp(perc),
-                            size: [256, 32].lerp(perc) as u32,
-                            expected_frequency: 440.0 * 2_f32.powf((i as f32 - 69.0) / 12.0),
-                            boost: 1.0,
-                        }
-                    })
-                    .collect(),
+            let mut strings = vec![];
+            // bass strings
+            for i in 0..50 {
+                strings.push(StringConfig {
+                    tension: 10.0,
+                    inertia: 90.0,
+                    elasticity: 1.0,
+                    size: 128,
+                    expected_frequency: 440.0 * 2_f32.powf((i as f32 - 69.0) / 12.0),
+                    boost: 1.0,
+                })
             }
+            // middle
+            for i in 50..70 {
+                strings.push(StringConfig {
+                    tension: 10.0,
+                    inertia: 30.0,
+                    elasticity: 0.1,
+                    size: 64,
+                    expected_frequency: 440.0 * 2_f32.powf((i as f32 - 69.0) / 12.0),
+                    boost: 1.0,
+                })
+            }
+            // treble
+            for i in 70..90 {
+                strings.push(StringConfig {
+                    tension: 1.0,
+                    inertia: 10.0,
+                    elasticity: 0.01,
+                    size: 48,
+                    expected_frequency: 440.0 * 2_f32.powf((i as f32 - 69.0) / 12.0),
+                    boost: 1.0,
+                })
+            }
+            // super treble
+            for i in 90..STRINGS_COUNT {
+                strings.push(StringConfig {
+                    tension: 1.0,
+                    inertia: 10.0,
+                    elasticity: 0.0001,
+                    size: 32,
+                    expected_frequency: 440.0 * 2_f32.powf((i as f32 - 69.0) / 12.0),
+                    boost: 1.0,
+                })
+            }
+
+            SerializedPiano { strings }
         }
     };
 
@@ -372,7 +403,7 @@ fn main() {
                                 piano.strings[note as usize].pluck(
                                     velocity as f32 / 255.0,
                                     0.4,
-                                    0.1,
+                                    0.3,
                                 );
                             }
                             ChannelVoiceMsg::NoteOff { note, .. } => {
