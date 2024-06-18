@@ -881,15 +881,14 @@ fn calc_correction(
     let tens_correction = required_freq_change * freq_per_tens_change;
 
     println!("tens {prev_tens} to {curr_tens}, caused freq {prev_freq} -> {curr_freq} (want {target}), correcting {tens_correction} ");
-    // to avoid overshoot
-    tens_correction * 0.5
+    tens_correction
 }
 
 #[test]
 fn adjust_smoke_test() {
-    assert_eq!(calc_correction(10.0, 15.0, 13.0, 1.3, 1.5), -0.04000001);
-    assert_eq!(calc_correction(15.0, 14.0, 10.0, 1.5, 1.45), -0.099999905);
-    assert_eq!(calc_correction(150.0, 140.0, 100.0, 1.5, 1.49), -0.01999998);
+    assert_eq!(calc_correction(10.0, 15.0, 13.0, 1.3, 1.5), -0.08000002);
+    assert_eq!(calc_correction(15.0, 14.0, 10.0, 1.5, 1.45), -0.19999981);
+    assert_eq!(calc_correction(150.0, 140.0, 160.0, 1.5, 1.49), 0.01999998);
 }
 
 #[test]
