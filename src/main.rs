@@ -18,7 +18,7 @@ use egui_plot::{Arrows, Line, Plot, PlotBounds, PlotPoints};
 use itertools::Itertools;
 use midi_msg::{ChannelVoiceMsg, ControlChange, MidiMsg};
 use midir::MidiInput;
-use rayon::iter::{IntoParallelRefMutIterator, ParallelIterator};
+use rayon::iter::{ParallelBridge, ParallelIterator};
 use rustfft::{
     num_complex::{Complex, ComplexFloat},
     Fft, FftPlanner,
@@ -295,10 +295,10 @@ fn main() {
     let sample_rate = config.sample_rate.0;
     println!("{config:?}");
 
-    let piano_config: SerializedPiano = match std::fs::read_to_string(config_path()) {
+    let piano_config: SerializedPiano = match fs_err::read_to_string(config_path()) {
         Ok(s) => serde_json::from_str(&s).unwrap(),
         Err(e) => {
-            println!("Error loading config file: {e}");
+            println!("Error loading piano file: {e}");
             SerializedPiano {
                 strings: (0..STRINGS_COUNT)
                     .map(|i| {
@@ -328,8 +328,6 @@ fn main() {
         .build_output_stream(
             &config,
             move |data: &mut [f32], _| {
-                // sustain on:
-                // ChannelVoice { channel: Ch1, msg: ControlChange { control: CC { control: 64, value: 127 } } }
                 while let Ok(msg) = midi_receiver.try_recv() {
                     {
                         let mut piano = piano.write().unwrap();
@@ -352,7 +350,7 @@ fn main() {
                                 }
                             }
                             ChannelVoiceMsg::ControlChange {
-                                // 64 is sustain
+                                // control 64 is sustain
                                 control: ControlChange::CC { control: 64, value },
                             } => {
                                 if value > 64 {
@@ -378,8 +376,9 @@ fn main() {
                             .write()
                             .unwrap()
                             .strings
-                            .par_iter_mut()
+                            .iter_mut()
                             .filter(|s| s.state.is_active)
+                            .par_bridge()
                             .map(|s| {
                                 (0..(buf_len / 2))
                                     .flat_map(|_| {
@@ -642,7 +641,7 @@ impl eframe::App for App {
                 }
                 if ui.button("save").clicked() {
                     let piano = self.piano.read().unwrap();
-                    std::fs::write(
+                    fs_err::write(
                         config_path(),
                         serde_json::to_string_pretty(&SerializedPiano::from(piano.deref()))
                             .unwrap(),
