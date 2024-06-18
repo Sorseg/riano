@@ -1,11 +1,10 @@
 use std::{
     collections::VecDeque,
     f32::consts::FRAC_PI_2,
-    io::Write,
     path::PathBuf,
     sync::{
         mpsc::{channel, Receiver, Sender},
-        Arc, Mutex, OnceLock, RwLock,
+        Arc, Mutex, RwLock,
     },
 };
 
@@ -14,9 +13,8 @@ use cpal::{
     BufferSize,
 };
 use eframe::egui::{self, CentralPanel, Color32, Grid, RichText, SidePanel, Slider, Vec2b, Window};
-use egui_plot::{Arrows, Line, Plot, PlotBounds, PlotPoints, VLine};
+use egui_plot::{Arrows, Line, Plot, PlotBounds, PlotPoints};
 
-use enterpolation::{linear::Linear, Equidistant, Generator, Identity};
 use itertools::Itertools;
 use midi_msg::{ChannelVoiceMsg, ControlChange, MidiMsg};
 use midir::MidiInput;
@@ -32,13 +30,10 @@ const VIS_BUF_SECS: f32 = 4.0;
 const VIS_BUF_SIZE: usize = (44100.0 * VIS_BUF_SECS) as usize;
 const VIS_BUF_SLACK: usize = 44100 * 3;
 
-const MAX_NON_LINEAR_FORCE: f32 = 0.0001;
-const CURVE_RES: usize = 1024;
-
 const STRINGS_COUNT: usize = 128;
 const LOWEST_KEY: usize = 21;
 const DAMPING_MUTED: f32 = 0.0003;
-const DAMPING_OPEN: f32 = 0.00003;
+const DAMPING_OPEN: f32 = 0.00002;
 // simulation runs this many steps per sample
 const SUB_STEPS: usize = 3;
 
@@ -130,6 +125,9 @@ impl From<&Piano> for SerializedPiano {
 
 #[allow(clippy::needless_range_loop)]
 fn force_for_displacement(d: f32) -> f32 {
+    // const MAX_NON_LINEAR_FORCE: f32 = 0.0001;
+    // const CURVE_RES: usize = 1024;
+
     // static POINTS: OnceLock<Linear<Equidistant<f32>, [f32; CURVE_RES], Identity>> = OnceLock::new();
 
     // let curve = POINTS.get_or_init(|| {
@@ -222,10 +220,11 @@ impl PianoString {
             if self.state.pos[i].abs() > active_thresh {
                 is_now_active = true;
             }
+
             // check for runaway
-            if self.state.pos[i].abs() > 100.0 {
+            if self.state.pos[i].abs() > 1000.0 {
                 self.state.ran_away = true;
-                println!("Runaway at {:?}", self.conf);
+                println!("Ran away at {:?}", self.conf);
 
                 self.reset();
                 return;
@@ -258,7 +257,7 @@ impl PianoString {
     fn calc_tens_force(&self, i: usize) -> f32 {
         let tension_force_target = (self.state.pos[i - 1] + self.state.pos[i + 1]) / 2.0;
 
-        let displacement = (tension_force_target - self.state.pos[i]).clamp(-0.01, 0.01);
+        let displacement = tension_force_target - self.state.pos[i];
         force_for_displacement(displacement * self.conf.tension)
     }
 
@@ -383,9 +382,9 @@ fn main() {
             for i in 70..90 {
                 strings.push(StringConfig {
                     tension: 1.0,
-                    inertia: 10.0,
+                    inertia: [10.0, 9.0].lerp((i - 70) as f32 / 10.0),
                     elasticity: 0.01,
-                    size: 48,
+                    size: 32,
                     expected_frequency: 440.0 * 2_f32.powf((i as f32 - 69.0) / 12.0),
                     boost: 1.0,
                 })
@@ -396,7 +395,7 @@ fn main() {
                     tension: 1.0,
                     inertia: 10.0,
                     elasticity: 0.000001,
-                    size: 24,
+                    size: 20,
                     expected_frequency: 440.0 * 2_f32.powf((i as f32 - 69.0) / 12.0),
                     boost: 1.0,
                 })
@@ -425,7 +424,11 @@ fn main() {
 
                         match msg {
                             ChannelVoiceMsg::NoteOn { note, velocity } => {
-                                piano.strings[note as usize].pluck(0.0, 0.4, 0.3);
+                                piano.strings[note as usize].pluck(
+                                    velocity as f32 / 255.0 / 10.0,
+                                    0.4,
+                                    0.3,
+                                );
                             }
                             ChannelVoiceMsg::NoteOff { note, .. } => {
                                 let sustain = piano.sustain;
