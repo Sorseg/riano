@@ -1,6 +1,7 @@
 use std::{
     collections::VecDeque,
     f32::consts::FRAC_PI_2,
+    io::Write,
     path::PathBuf,
     sync::{
         mpsc::{channel, Receiver, Sender},
@@ -20,6 +21,7 @@ use itertools::Itertools;
 use midi_msg::{ChannelVoiceMsg, ControlChange, MidiMsg};
 use midir::MidiInput;
 use rayon::iter::{ParallelBridge, ParallelIterator};
+use ringbuf::traits::{Consumer, Producer, Split};
 use rustfft::{
     num_complex::{Complex, ComplexFloat},
     Fft, FftPlanner,
@@ -195,6 +197,10 @@ impl PianoString {
         self.state.vel[last - 1] = 0.0;
     }
 
+    fn apply_pressure(&mut self, p: f32) {
+        self.state.vel[4] += p;
+    }
+
     fn tick(&mut self) {
         for _ in 0..SUB_STEPS {
             self.advance();
@@ -217,7 +223,7 @@ impl PianoString {
                 is_now_active = true;
             }
             // check for runaway
-            if self.state.pos[i].abs() > 1000.0 {
+            if self.state.pos[i].abs() > 100.0 {
                 self.state.ran_away = true;
                 println!("Runaway at {:?}", self.conf);
 
@@ -246,7 +252,7 @@ impl PianoString {
             }
         }
 
-        self.state.is_active = is_now_active;
+        self.state.is_active = is_now_active || self.state.on;
     }
 
     fn calc_tens_force(&self, i: usize) -> f32 {
@@ -322,11 +328,29 @@ fn main() {
     // AUDIO
     let host = cpal::default_host();
     let dev = host.default_output_device().unwrap();
-    let mut config: cpal::StreamConfig = dev.default_output_config().unwrap().into();
-    config.buffer_size = BufferSize::Fixed(256);
-    assert_eq!(config.channels, 2);
-    let sample_rate = config.sample_rate.0;
-    println!("{config:?}");
+    let mut playback_config: cpal::StreamConfig = dev.default_output_config().unwrap().into();
+    let record_ringbuf = ringbuf::HeapRb::new(256);
+    let (mut record_sender, mut record_listener) = record_ringbuf.split();
+    playback_config.buffer_size = BufferSize::Fixed(256 * 4);
+    assert_eq!(playback_config.channels, 2);
+    let sample_rate = playback_config.sample_rate.0;
+    println!("{playback_config:?}");
+    let mut record_config: cpal::StreamConfig = dev.default_input_config().unwrap().into();
+    record_config.buffer_size = BufferSize::Fixed(1024);
+
+    let record_stream = dev
+        .build_input_stream(
+            &record_config,
+            move |d: &[f32], _| {
+                for s in d {
+                    _ = record_sender.try_push(*s);
+                }
+            },
+            |err| eprintln!("Error recording {err}"),
+            None,
+        )
+        .unwrap();
+    record_stream.play().unwrap();
 
     let piano_config: SerializedPiano = match fs_err::read_to_string(config_path()) {
         Ok(s) => serde_json::from_str(&s).unwrap(),
@@ -371,8 +395,8 @@ fn main() {
                 strings.push(StringConfig {
                     tension: 1.0,
                     inertia: 10.0,
-                    elasticity: 0.0001,
-                    size: 32,
+                    elasticity: 0.000001,
+                    size: 24,
                     expected_frequency: 440.0 * 2_f32.powf((i as f32 - 69.0) / 12.0),
                     boost: 1.0,
                 })
@@ -389,9 +413,10 @@ fn main() {
 
     let piano2 = Arc::clone(&piano);
     let string_calc_pool = rayon::ThreadPoolBuilder::new().build().unwrap();
+    let mut record_listener_buffer = vec![0.0; 256];
     let stream = dev
         .build_output_stream(
-            &config,
+            &playback_config,
             move |data: &mut [f32], _| {
                 while let Ok(msg) = midi_receiver.try_recv() {
                     {
@@ -400,11 +425,7 @@ fn main() {
 
                         match msg {
                             ChannelVoiceMsg::NoteOn { note, velocity } => {
-                                piano.strings[note as usize].pluck(
-                                    velocity as f32 / 255.0,
-                                    0.4,
-                                    0.3,
-                                );
+                                piano.strings[note as usize].pluck(0.0, 0.4, 0.3);
                             }
                             ChannelVoiceMsg::NoteOff { note, .. } => {
                                 let sustain = piano.sustain;
@@ -433,8 +454,13 @@ fn main() {
                         };
                     }
                 }
-
                 let buf_len = data.len();
+                let record = record_listener.pop_slice(&mut record_listener_buffer);
+                record_listener_buffer.resize(buf_len, 0.0);
+                if record != 256 {
+                    println!("read from rec buffer {record}");
+                }
+
                 {
                     let buffers = string_calc_pool.install(|| {
                         piano
@@ -446,7 +472,10 @@ fn main() {
                             .par_bridge()
                             .map(|s| {
                                 (0..(buf_len / 2))
-                                    .flat_map(|_| {
+                                    .flat_map(|i| {
+                                        if s.state.on {
+                                            s.apply_pressure(record_listener_buffer[i]);
+                                        }
                                         s.tick();
                                         [s.listen_left(), s.listen_right()]
                                     })
@@ -734,7 +763,7 @@ impl eframe::App for App {
             Plot::new("waveform")
                 .auto_bounds(Vec2b { x: true, y: false })
                 .allow_double_click_reset(false)
-                .height(ui.available_height() / 3.0)
+                .height(ui.available_height() / 2.0)
                 .show(ui, |ui| {
                     if reset_zoom {
                         ui.set_plot_bounds(PlotBounds::from_min_max(
@@ -769,49 +798,6 @@ impl eframe::App for App {
                     ui.line(Line::new(left).name("left"));
                     ui.line(Line::new(right).name("right"));
                     ui.line(Line::new(locked).name("locked"));
-                });
-
-            Plot::new("tens curve")
-                .height(ui.available_height() / 2.0)
-                .show(ui, |ui| {
-                    let res = CURVE_RES * 2;
-                    ui.line(
-                        Line::new(
-                            (0..res)
-                                .map(|i| {
-                                    [
-                                        i as f64 / res as f64 * MAX_NON_LINEAR_FORCE as f64,
-                                        force_for_displacement(
-                                            i as f32 / res as f32 * MAX_NON_LINEAR_FORCE,
-                                        ) as f64,
-                                    ]
-                                })
-                                .collect_vec(),
-                        )
-                        .name("non-linear"),
-                    );
-                    ui.line(
-                        Line::new(
-                            (res..res * 2)
-                                .map(|i| {
-                                    [
-                                        i as f64 / res as f64 * MAX_NON_LINEAR_FORCE as f64,
-                                        force_for_displacement(
-                                            i as f32 / res as f32 * MAX_NON_LINEAR_FORCE,
-                                        ) as f64,
-                                    ]
-                                })
-                                .collect_vec(),
-                        )
-                        .name("linear"),
-                    );
-                    for s in piano_clone.strings.iter().filter(|s| s.state.is_active) {
-                        let max_force = (2..(s.state.pos.len() - 2))
-                            .map(|i| s.calc_tens_force(i).abs())
-                            .max_by(|f1, f2| f1.total_cmp(f2))
-                            .expect("at least one point in the string");
-                        ui.vline(VLine::new(max_force));
-                    }
                 });
 
             Plot::new("strings vis")
