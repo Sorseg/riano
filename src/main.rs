@@ -1,11 +1,10 @@
 use std::{
     collections::VecDeque,
     f32::consts::FRAC_PI_2,
-    ops::Deref,
     path::PathBuf,
     sync::{
         mpsc::{channel, Receiver, Sender},
-        Arc, Mutex, RwLock,
+        Arc, Mutex, OnceLock, RwLock,
     },
 };
 
@@ -14,7 +13,8 @@ use cpal::{
     BufferSize,
 };
 use eframe::egui::{self, CentralPanel, Color32, Grid, RichText, SidePanel, Slider, Vec2b, Window};
-use egui_plot::{Arrows, Line, Plot, PlotBounds, PlotPoints};
+use egui_plot::{Arrows, Line, Plot, PlotBounds, PlotPoints, VLine};
+
 use itertools::Itertools;
 use midi_msg::{ChannelVoiceMsg, ControlChange, MidiMsg};
 use midir::MidiInput;
@@ -45,6 +45,7 @@ impl Lerp for [u32; 2] {
     }
 }
 
+#[derive(Clone)]
 struct Piano {
     strings: Vec<PianoString>,
     sustain: bool,
@@ -114,6 +115,38 @@ impl From<&Piano> for SerializedPiano {
     }
 }
 
+const MAX_SQRT_FORCE: f32 = 0.3;
+const MAX_EXPECTED_FORCE: f32 = 0.5;
+const CURVE_RES: usize = 2048;
+
+// it is clearer this way
+#[allow(clippy::needless_range_loop)]
+fn force_for_displacement(d: f32) -> f32 {
+    let scale = MAX_EXPECTED_FORCE / CURVE_RES as f32;
+    let abs_scaled = d.abs() / scale;
+    static POINTS: OnceLock<[f32; CURVE_RES]> = OnceLock::new();
+    let curve = POINTS.get_or_init(|| {
+        let mut curves = [0.0; CURVE_RES];
+        let change_point = (MAX_SQRT_FORCE / scale) as usize;
+        for i in 0..change_point {
+            curves[i] = (i as f32).sqrt() * scale * 10.0
+        }
+        let derivative = curves[change_point - 1] - curves[change_point - 2];
+        for i in change_point..curves.len() {
+            curves[i] = curves[change_point - 1] + (i - change_point) as f32 * derivative;
+        }
+        curves
+    });
+
+    let left_num = abs_scaled.floor();
+    let right_num = abs_scaled.ceil();
+    let rightness = abs_scaled - left_num;
+    let left_val = curve[(left_num as usize).clamp(0, curve.len() - 1)];
+    let right_val = curve[(right_num as usize).clamp(0, curve.len() - 1)];
+
+    (left_val * (1.0 - rightness) + right_val * rightness) * d.signum()
+}
+
 impl PianoString {
     fn pluck(&mut self, vel: f32, pos: f32, width: f32) {
         self.state.damping = DAMPING_OPEN;
@@ -167,9 +200,7 @@ impl PianoString {
     }
 
     fn advance(&mut self) {
-        let st = &mut self.state;
-
-        if !st.is_active {
+        if !self.state.is_active {
             return;
         }
 
@@ -177,15 +208,15 @@ impl PianoString {
         let active_thresh = 0.0001;
 
         // apply velocity
-        for i in 1..(st.pos.len() - 1) {
-            st.pos[i] += st.vel[i] / self.conf.inertia;
+        for i in 1..(self.state.pos.len() - 1) {
+            self.state.pos[i] += self.state.vel[i] / self.conf.inertia;
 
-            if st.pos[i].abs() > active_thresh {
+            if self.state.pos[i].abs() > active_thresh {
                 is_now_active = true;
             }
             // check for runaway
-            if st.pos[i].abs() > 1000.0 {
-                st.ran_away = true;
+            if self.state.pos[i].abs() > 1000.0 {
+                self.state.ran_away = true;
                 println!("Runaway at {:?}", self.conf);
 
                 self.reset();
@@ -194,28 +225,33 @@ impl PianoString {
         }
 
         // apply tension and elasticity
-        for i in 2..(st.pos.len() - 2) {
-            let straight_from_left = st.pos[i - 1] - st.pos[i - 2];
-            let left_force_target = st.pos[i - 1] + straight_from_left * 2.0;
+        for i in 2..(self.state.pos.len() - 2) {
+            let straight_from_left = self.state.pos[i - 1] - self.state.pos[i - 2];
+            let left_force_target = self.state.pos[i - 1] + straight_from_left * 2.0;
 
-            let right_vec = st.pos[i + 1] - st.pos[i + 2];
-            let right_vec_target = st.pos[i + 1] + right_vec * 2.0;
+            let right_vec = self.state.pos[i + 1] - self.state.pos[i + 2];
+            let right_vec_target = self.state.pos[i + 1] + right_vec * 2.0;
 
             let elastic_force_target = (left_force_target + right_vec_target) / 2.0;
-            let tension_force_target = (st.pos[i - 1] + st.pos[i + 1]) / 2.0;
 
-            let tension_force = tension_force_target - st.pos[i];
-            let elastic_force = elastic_force_target - st.pos[i];
+            let elastic_force = elastic_force_target - self.state.pos[i];
 
-            st.vel[i] += tension_force * self.conf.tension + elastic_force * self.conf.elasticity;
-            st.vel[i] *= 1.0 - st.damping;
+            self.state.vel[i] += self.calc_tens_force(i) + elastic_force * self.conf.elasticity;
+            self.state.vel[i] *= 1.0 - self.state.damping;
 
-            if st.vel[i].abs() > active_thresh {
+            if self.state.vel[i].abs() > active_thresh {
                 is_now_active = true;
             }
         }
 
-        st.is_active = is_now_active;
+        self.state.is_active = is_now_active;
+    }
+
+    fn calc_tens_force(&self, i: usize) -> f32 {
+        let tension_force_target = (self.state.pos[i - 1] + self.state.pos[i + 1]) / 2.0;
+
+        let displacement = tension_force_target - self.state.pos[i];
+        force_for_displacement(displacement * self.conf.tension)
     }
 
     fn reset(&mut self) {
@@ -304,9 +340,9 @@ fn main() {
                     .map(|i| {
                         let perc = i as f32 / (STRINGS_COUNT - 1) as f32;
                         StringConfig {
-                            tension: [2.0, 0.3].lerp(perc),
-                            inertia: [30.0, 4.0].lerp(perc),
-                            elasticity: [0.06, 0.00001].lerp(perc),
+                            tension: [1.0, 0.3].lerp(perc),
+                            inertia: [30.0, 10.0].lerp(perc),
+                            elasticity: [0.06, 0.0001].lerp(perc),
                             size: [128, 32].lerp(perc) as u32,
                             expected_frequency: 440.0 * 2_f32.powf((i as f32 - 69.0) / 12.0),
                             boost: 1.0,
@@ -504,6 +540,8 @@ impl eframe::App for App {
             }
         }
 
+        let mut piano_clone = self.piano.read().unwrap().clone();
+
         SidePanel::left("strings settings").show(ctx, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 let tune_bg = |piano: Arc<RwLock<Piano>>, i: usize, fd: Arc<FreqDetector>| {
@@ -527,6 +565,7 @@ impl eframe::App for App {
                         sender.send((i, freq, spl)).unwrap();
                     });
                 };
+
                 Grid::new("strings settings items")
                     .striped(true)
                     .show(ui, |ui| {
@@ -547,9 +586,7 @@ impl eframe::App for App {
                         });
                         ui.end_row();
 
-                        let mut strings_clone = self.piano.read().unwrap().strings.clone();
-
-                        for (i, s) in strings_clone.iter_mut().enumerate().skip(LOWEST_KEY) {
+                        for (i, s) in piano_clone.strings.iter_mut().enumerate().skip(LOWEST_KEY) {
                             ui.label(RichText::new(format!("{i}")).background_color(
                                 Color32::from_rgb(
                                     if s.state.ran_away { 255 } else { 0 },
@@ -604,9 +641,11 @@ impl eframe::App for App {
                             ui.end_row();
                         }
                         let mut real_piano = self.piano.write().unwrap();
-                        for (real_s, new_s) in real_piano.strings.iter_mut().zip(strings_clone) {
+                        for (real_s, new_s) in
+                            real_piano.strings.iter_mut().zip(&piano_clone.strings)
+                        {
                             real_s.state.current_frequency = new_s.state.current_frequency;
-                            real_s.conf = new_s.conf;
+                            real_s.conf = new_s.conf.clone();
                             real_s.resize();
                         }
                         while let Ok((i, freq, level)) = self.freq_meas_channel.1.try_recv() {
@@ -639,11 +678,9 @@ impl eframe::App for App {
                     self.locked.clear();
                 }
                 if ui.button("save").clicked() {
-                    let piano = self.piano.read().unwrap();
                     fs_err::write(
                         config_path(),
-                        serde_json::to_string_pretty(&SerializedPiano::from(piano.deref()))
-                            .unwrap(),
+                        serde_json::to_string_pretty(&SerializedPiano::from(&piano_clone)).unwrap(),
                     )
                     .unwrap();
                 }
@@ -653,7 +690,7 @@ impl eframe::App for App {
             Plot::new("waveform")
                 .auto_bounds(Vec2b { x: true, y: false })
                 .allow_double_click_reset(false)
-                .height(ui.available_height() / 2.0)
+                .height(ui.available_height() / 3.0)
                 .show(ui, |ui| {
                     if reset_zoom {
                         ui.set_plot_bounds(PlotBounds::from_min_max(
@@ -688,6 +725,31 @@ impl eframe::App for App {
                     ui.line(Line::new(left).name("left"));
                     ui.line(Line::new(right).name("right"));
                     ui.line(Line::new(locked).name("locked"));
+                });
+
+            Plot::new("tens curve")
+                .height(ui.available_height() / 2.0)
+                .show(ui, |ui| {
+                    ui.line(
+                        Line::new(
+                            (0..(MAX_EXPECTED_FORCE * 11.0) as usize)
+                                .map(|i| {
+                                    [
+                                        i as f64 / 10.0,
+                                        force_for_displacement(i as f32 / 10.0) as f64,
+                                    ]
+                                })
+                                .collect_vec(),
+                        )
+                        .name("x"),
+                    );
+                    for s in piano_clone.strings.iter().filter(|s| s.state.is_active) {
+                        let max_force = (2..(s.conf.size - 2))
+                            .map(|i| s.calc_tens_force(i as usize).abs())
+                            .max_by(|f1, f2| f1.total_cmp(f2))
+                            .expect("at least one point in the string");
+                        ui.vline(VLine::new(max_force));
+                    }
                 });
 
             Plot::new("strings vis")
