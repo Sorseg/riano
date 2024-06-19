@@ -337,22 +337,47 @@ fn main() {
     // AUDIO
     let host = cpal::default_host();
     let dev = host.default_output_device().unwrap();
+    println!("Audio dev {:?}", dev.name());
+    println!("Supported out: {:?}", dev.default_output_config().unwrap());
+    println!("Supported in: {:?}", dev.default_input_config().unwrap());
+
     let mut playback_config: cpal::StreamConfig = dev.default_output_config().unwrap().into();
-    let record_ringbuf = ringbuf::HeapRb::new(256);
+
+    // I do not understand how buffer size setting affects the actual buffer sizes.
+    // The amount of samples is half for the playback (because of 2 channels) and a quarter for recording
+    // Will configure something that works and deal with differently sized buffers in the code
+    let rec_buffer_size = 256;
+    let play_buffer_size = 256;
+    let safety_margin = 4;
+
+    playback_config.channels = 2;
+    playback_config.buffer_size = BufferSize::Fixed(play_buffer_size as u32);
+
+    let record_ringbuf = ringbuf::HeapRb::new(rec_buffer_size * safety_margin);
     let (mut record_sender, mut record_listener) = record_ringbuf.split();
-    playback_config.buffer_size = BufferSize::Fixed(256 * 2);
-    assert_eq!(playback_config.channels, 2);
+    // a second listener-local quasi-ringbuffer
+    let mut record_listener_receive_buffer =
+        Vec::with_capacity(play_buffer_size / playback_config.channels as usize);
+    let mut read_samples = 0;
+
     let sample_rate = playback_config.sample_rate.0;
-    println!("{playback_config:?}");
+
     let mut record_config: cpal::StreamConfig = dev.default_input_config().unwrap().into();
-    record_config.buffer_size = BufferSize::Fixed(256 * 3 );
+    record_config.buffer_size = BufferSize::Fixed(rec_buffer_size as u32);
+    record_config.channels = 1;
+    record_config.sample_rate = playback_config.sample_rate;
+
+    println!("Playback {playback_config:?}");
+    println!("Recording {record_config:?}");
 
     let record_stream = dev
         .build_input_stream(
             &record_config,
             move |d: &[f32], _| {
                 for s in d {
-                    _ = record_sender.try_push(*s);
+                    if record_sender.try_push(*s).is_err() {
+                        // println!("Error sending rec {e}");
+                    }
                 }
             },
             |err| eprintln!("Error recording {err}"),
@@ -424,7 +449,6 @@ fn main() {
 
     let piano2 = Arc::clone(&piano);
     let string_calc_pool = rayon::ThreadPoolBuilder::new().build().unwrap();
-    let mut record_listener_buffer = vec![0.0; 256];
     let stream = dev
         .build_output_stream(
             &playback_config,
@@ -471,8 +495,20 @@ fn main() {
                     }
                 }
                 let buf_len = data.len();
-                record_listener.pop_slice(&mut record_listener_buffer);
-                record_listener_buffer.resize(buf_len, 0.0);
+                let samples_count = buf_len / playback_config.channels as usize;
+                record_listener_receive_buffer.resize(samples_count, 0.0);
+                // FIXME: the buffer is sometimes of length 189, which might be less than read samples
+                let listened = record_listener
+                    .pop_slice(&mut record_listener_receive_buffer[read_samples..samples_count]);
+                read_samples += listened;
+                if read_samples < record_listener_receive_buffer.len() {
+                    println!(
+                        "Input is still filling the buffer: {}",
+                        record_listener_receive_buffer.len()
+                    );
+                } else {
+                    read_samples = 0;
+                }
 
                 {
                     let buffers = string_calc_pool.install(|| {
@@ -485,11 +521,11 @@ fn main() {
                             .filter(|s| s.state.is_ringing)
                             .par_bridge()
                             .map(|s| {
-                                (0..(buf_len / 2))
+                                (0..samples_count)
                                     .flat_map(|i| {
                                         if s.state.is_active {
                                             s.apply_pressure(
-                                                record_listener_buffer[i] * vocoder_lever,
+                                                record_listener_receive_buffer[i] * vocoder_lever,
                                             );
                                         }
                                         s.tick(sustain);
