@@ -340,12 +340,12 @@ fn main() {
     let mut playback_config: cpal::StreamConfig = dev.default_output_config().unwrap().into();
     let record_ringbuf = ringbuf::HeapRb::new(256);
     let (mut record_sender, mut record_listener) = record_ringbuf.split();
-    playback_config.buffer_size = BufferSize::Fixed(256 * 4);
+    playback_config.buffer_size = BufferSize::Fixed(256 * 2);
     assert_eq!(playback_config.channels, 2);
     let sample_rate = playback_config.sample_rate.0;
     println!("{playback_config:?}");
     let mut record_config: cpal::StreamConfig = dev.default_input_config().unwrap().into();
-    record_config.buffer_size = BufferSize::Fixed(1024);
+    record_config.buffer_size = BufferSize::Fixed(256 * 3 );
 
     let record_stream = dev
         .build_input_stream(
