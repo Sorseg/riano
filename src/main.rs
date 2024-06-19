@@ -364,7 +364,7 @@ fn main() {
     let piano_config: SerializedPiano = match fs_err::read_to_string(config_path()) {
         Ok(s) => serde_json::from_str(&s).unwrap(),
         Err(e) => {
-            println!("Error loading piano file: {e}");
+            println!("Error loading piano file, using generated config: {e}\n");
             let mut strings = vec![];
             // bass strings
             for i in 0..50 {
@@ -382,7 +382,7 @@ fn main() {
                 strings.push(StringConfig {
                     tension: 10.0,
                     inertia: 30.0,
-                    elasticity: 0.1,
+                    elasticity: 0.4,
                     size: 64,
                     expected_frequency: 440.0 * 2_f32.powf((i as f32 - 69.0) / 12.0),
                     boost: 1.0,
@@ -393,7 +393,7 @@ fn main() {
                 strings.push(StringConfig {
                     tension: 1.0,
                     inertia: [10.0, 9.0].lerp((i - 70) as f32 / 10.0),
-                    elasticity: 0.01,
+                    elasticity: 0.1,
                     size: 32,
                     expected_frequency: 440.0 * 2_f32.powf((i as f32 - 69.0) / 12.0),
                     boost: 1.0,
@@ -471,11 +471,8 @@ fn main() {
                     }
                 }
                 let buf_len = data.len();
-                let record = record_listener.pop_slice(&mut record_listener_buffer);
+                record_listener.pop_slice(&mut record_listener_buffer);
                 record_listener_buffer.resize(buf_len, 0.0);
-                if record != 256 {
-                    println!("read from rec buffer {record}");
-                }
 
                 {
                     let buffers = string_calc_pool.install(|| {
@@ -515,9 +512,8 @@ fn main() {
                 }
 
                 let mut vis_buf = vis_buf.lock().unwrap();
-                vis_buf.extend(data.iter().copied());
-                if vis_buf.len() > VIS_BUF_SIZE + VIS_BUF_SLACK {
-                    panic!("visual buf not being consumed");
+                if vis_buf.len() < VIS_BUF_SIZE + VIS_BUF_SLACK {
+                    vis_buf.extend(data.iter().copied());
                 }
             },
             |err| eprintln!("{err:?}"),
