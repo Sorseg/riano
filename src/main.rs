@@ -1,6 +1,5 @@
 use std::{
     collections::VecDeque,
-    f32::consts::FRAC_PI_2,
     path::PathBuf,
     sync::{
         mpsc::{channel, Receiver, Sender},
@@ -15,6 +14,7 @@ use cpal::{
 use eframe::egui::{self, CentralPanel, Color32, Grid, RichText, SidePanel, Slider, Vec2b, Window};
 use egui_plot::{Arrows, Line, Plot, PlotBounds, PlotPoints};
 
+use glam::Vec2;
 use itertools::Itertools;
 use midi_msg::{ChannelVoiceMsg, ControlChange, MidiMsg};
 use midir::MidiInput;
@@ -77,8 +77,8 @@ struct StringState {
     /// will be simulated
     is_ringing: bool,
     current_frequency: f32,
-    pos: Vec<f32>,
-    vel: Vec<f32>,
+    pos: Vec<Vec2>,
+    vel: Vec<Vec2>,
     ran_away: bool,
 }
 
@@ -107,8 +107,13 @@ impl From<StringConfig> for PianoString {
                 is_ringing: false,
                 current_frequency: 0.0,
                 ran_away: false,
-                pos: vec![0.0; value.size as usize],
-                vel: vec![0.0; value.size as usize],
+                pos: (0..value.size)
+                    .map(|i| Vec2 {
+                        x: i as f32,
+                        y: 0.0,
+                    })
+                    .collect(),
+                vel: vec![Vec2::ZERO; value.size as usize],
             },
             conf: value,
         }
@@ -169,21 +174,27 @@ impl PianoString {
         let pluck_width = (self.state.pos.len() as f32 * width / 2.0) as usize;
         for i in (place_to_pluck - pluck_width)..=(place_to_pluck + pluck_width) {
             let distance_from_place_to_pluck = i as f32 - place_to_pluck as f32;
-            self.state.vel[i] =
-                (distance_from_place_to_pluck / pluck_width as f32 * FRAC_PI_2).cos() * vel;
+            let x = distance_from_place_to_pluck / pluck_width as f32;
+            self.state.vel[i].y = 100_f32.powf(-x * x) * vel;
         }
     }
 
+    fn get_tension_at(&self, i: usize) -> f32 {
+        // FIXME: orthogonal vs compression wave
+        let disp = self.state.pos[i].y;
+        disp * self.conf.boost
+    }
+
     fn listen_left(&self) -> f32 {
-        self.state.pos[(self.state.pos.len() as f32 * 0.2) as usize] * self.conf.boost
+        self.get_tension_at(3)
     }
 
     fn listen_right(&self) -> f32 {
-        self.state.pos[(self.state.pos.len() as f32 * 0.25) as usize] * self.conf.boost
+        self.get_tension_at(self.state.pos.len() - 4)
     }
 
-    fn listen_mid_unboosted(&self) -> f32 {
-        self.state.pos[self.state.pos.len() / 2]
+    fn listen_unboosted(&self) -> f32 {
+        self.state.pos[3].y
     }
 
     /// needs to be called before plucking
@@ -191,20 +202,33 @@ impl PianoString {
         let new_size = self.conf.size as usize;
         assert!(new_size > 4);
         self.conf.size = new_size as u32;
-        self.state.pos.resize(new_size, 0.0);
-        self.state.vel.resize(new_size, 0.0);
+        self.state.pos.truncate(new_size);
+        for i in self.state.pos.len()..new_size {
+            self.state.pos.push(Vec2 {
+                x: i as f32,
+                y: 0.0,
+            })
+        }
+        self.state.vel.resize(new_size, Vec2::ZERO);
 
         // make sure the string is still attached horizontaly
         // and not flying away
         let last = self.state.pos.len() - 1;
-        self.state.pos[last] = 0.0;
-        self.state.pos[last - 1] = 0.0;
-        self.state.vel[last] = 0.0;
-        self.state.vel[last - 1] = 0.0;
+        self.state.pos[last] = Vec2 {
+            x: last as f32,
+            y: 0.0,
+        };
+        self.state.pos[last - 1] = Vec2 {
+            x: (last - 1) as f32,
+            y: 0.0,
+        };
+        self.state.vel[last] = Vec2::ZERO;
+        self.state.vel[last - 1] = Vec2::ZERO;
     }
 
     fn apply_pressure(&mut self, p: f32) {
-        self.state.vel[8] += p;
+        // FIXME: smooth front
+        self.state.vel[8].y += p;
     }
 
     fn tick(&mut self, sustain: bool) {
@@ -227,12 +251,12 @@ impl PianoString {
         for i in 1..(self.state.pos.len() - 1) {
             self.state.pos[i] += self.state.vel[i] / self.conf.inertia;
 
-            if self.state.pos[i].abs() > active_thresh {
+            if self.state.pos[i].y.abs() > active_thresh {
                 is_now_active = true;
             }
 
             // check for runaway
-            if self.state.pos[i].abs() > 1000.0 {
+            if self.state.pos[i].y.abs() > 1000.0 {
                 self.state.ran_away = true;
                 println!("Ran away at {:?}", self.conf);
 
@@ -243,20 +267,13 @@ impl PianoString {
 
         // apply tension and elasticity
         for i in 2..(self.state.pos.len() - 2) {
-            let straight_from_left = self.state.pos[i - 1] - self.state.pos[i - 2];
-            let left_force_target = self.state.pos[i - 1] + straight_from_left * 2.0;
+            let elastic_force = self.calc_bend_force(i);
+            let tens_force = self.calc_tens_force(i);
 
-            let right_vec = self.state.pos[i + 1] - self.state.pos[i + 2];
-            let right_vec_target = self.state.pos[i + 1] + right_vec * 2.0;
-
-            let elastic_force_target = (left_force_target + right_vec_target) / 2.0;
-
-            let elastic_force = elastic_force_target - self.state.pos[i];
-
-            self.state.vel[i] += self.calc_tens_force(i) + elastic_force * self.conf.elasticity;
+            self.state.vel[i] += tens_force + elastic_force;
             self.state.vel[i] *= 1.0 - self.state.damping;
 
-            if self.state.vel[i].abs() > active_thresh {
+            if self.state.vel[i].length_squared() > active_thresh {
                 is_now_active = true;
             }
         }
@@ -264,16 +281,55 @@ impl PianoString {
         self.state.is_ringing = is_now_active || self.state.on || sustain;
     }
 
-    fn calc_tens_force(&self, i: usize) -> f32 {
-        let tension_force_target = (self.state.pos[i - 1] + self.state.pos[i + 1]) / 2.0;
+    fn calc_tens_force(&self, i: usize) -> Vec2 {
+        let mut res = Vec2::ZERO;
+        for neighbour in [self.state.pos[i - 1], self.state.pos[i + 1]] {
+            let displacement = 1.0 - self.state.pos[i].distance(neighbour) - self.conf.tension;
 
-        let displacement = tension_force_target - self.state.pos[i];
-        force_for_displacement(displacement * self.conf.tension)
+            let displacement_vec = self.state.pos[i] - neighbour;
+            res += force_for_displacement(displacement * self.conf.tension) * displacement_vec
+        }
+        res
+    }
+    fn calc_bend_force(&self, i: usize) -> Vec2 {
+        let mut res = Vec2::ZERO;
+        for [prevprev, prev] in [[-2_isize, -1], [2, 1]] {
+            /*
+                        i-2        i-1
+                         o----------o
+                                ^    \
+                                |     \ <- beam
+                 affecting beam |      o
+                                       i
+
+            same on the other side
+            */
+            let affecting_beam = self.state.pos[i.saturating_add_signed(prev)]
+                - self.state.pos[i.saturating_add_signed(prevprev)];
+            let beam = self.state.pos[i] - self.state.pos[i.saturating_add_signed(prev)];
+
+            // // this is correct but too expensive:
+            // let mut bend = affecting_beam.angle_to(beam);
+            // bend = (bend.abs() - bend_dead_zone).max(0.0) * bend.signum();
+            // let correction_vec = beam.perp();
+
+            let correction_vec = -beam.reject_from(affecting_beam);
+
+            res += correction_vec
+        }
+        res * self.conf.elasticity
+        
     }
 
     fn reset(&mut self) {
-        self.state.pos.iter_mut().for_each(|p| *p = 0.0);
-        self.state.vel.iter_mut().for_each(|p| *p = 0.0);
+        self.state.pos.iter_mut().enumerate().for_each(|(i, p)| {
+            // FIXME: dedup
+            *p = Vec2 {
+                x: i as f32,
+                y: 0.0,
+            }
+        });
+        self.state.vel.iter_mut().for_each(|p| *p = Vec2::ZERO);
     }
 
     fn ringing_clone(&self) -> Self {
@@ -346,8 +402,8 @@ fn main() {
     // I do not understand how buffer size setting affects the actual buffer sizes.
     // The amount of samples is half for the playback (because of 2 channels) and a quarter for recording
     // Will configure something that works and deal with differently sized buffers in the code
-    let rec_buffer_size = 256;
-    let play_buffer_size = 256;
+    let rec_buffer_size = 256 * 2;
+    let play_buffer_size = 256 * 2;
     let safety_margin = 4;
 
     playback_config.channels = 2;
@@ -394,7 +450,7 @@ fn main() {
             // bass strings
             for i in 0..50 {
                 strings.push(StringConfig {
-                    tension: 10.0,
+                    tension: 2.0,
                     inertia: 90.0,
                     elasticity: 1.0,
                     size: 128,
@@ -405,7 +461,7 @@ fn main() {
             // middle
             for i in 50..70 {
                 strings.push(StringConfig {
-                    tension: 10.0,
+                    tension: 2.0,
                     inertia: 30.0,
                     elasticity: 0.4,
                     size: 64,
@@ -416,7 +472,7 @@ fn main() {
             // treble
             for i in 70..90 {
                 strings.push(StringConfig {
-                    tension: 1.0,
+                    tension: 2.0,
                     inertia: [10.0, 9.0].lerp((i - 70) as f32 / 10.0),
                     elasticity: 0.1,
                     size: 32,
@@ -427,7 +483,7 @@ fn main() {
             // super treble
             for i in 90..STRINGS_COUNT {
                 strings.push(StringConfig {
-                    tension: 1.0,
+                    tension: 0.1,
                     inertia: 10.0,
                     elasticity: 0.000001,
                     size: 20,
@@ -497,11 +553,14 @@ fn main() {
                 let buf_len = data.len();
                 let samples_count = buf_len / playback_config.channels as usize;
                 record_listener_receive_buffer.resize(samples_count, 0.0);
-                // FIXME: the buffer is sometimes of length 189, which might be less than read samples
-                let listened = record_listener
-                    .pop_slice(&mut record_listener_receive_buffer[read_samples..samples_count]);
-                read_samples += listened;
-                if read_samples < record_listener_receive_buffer.len() {
+
+                if read_samples < samples_count {
+                    let listened = record_listener.pop_slice(
+                        &mut record_listener_receive_buffer[read_samples..samples_count],
+                    );
+                    read_samples += listened;
+                }
+                if read_samples < samples_count {
                     println!(
                         "Input is still filling the buffer: {}",
                         record_listener_receive_buffer.len()
@@ -625,8 +684,7 @@ impl eframe::App for App {
                             .pos
                             .iter()
                             .copied()
-                            .enumerate()
-                            .map(|(i, s)| [i as f64, s as f64]);
+                            .map(|s| [s.x as f64, s.y as f64]);
 
                         ui.line(Line::new(pos_iter.clone().collect::<PlotPoints>()));
                         let vel = s
@@ -634,9 +692,8 @@ impl eframe::App for App {
                             .vel
                             .iter()
                             .copied()
-                            .enumerate()
                             .zip(&s.state.pos)
-                            .map(|((i, v), p)| [i as f64, (v + *p) as f64])
+                            .map(|(v, p)| [(v.x + p.x) as f64, (v.y + p.y) as f64])
                             .collect::<PlotPoints>();
                         ui.arrows(
                             Arrows::new(pos_iter.clone().collect::<PlotPoints>(), vel)
@@ -699,7 +756,8 @@ impl eframe::App for App {
                             ui.label(RichText::new(format!("{i}")).background_color(
                                 Color32::from_rgb(
                                     if s.state.ran_away { 255 } else { 0 },
-                                    (s.state.pos.iter().sum::<f32>().abs() * 255.0) as u8,
+                                    (s.state.pos.iter().map(|p| p.y).sum::<f32>().abs() * 255.0)
+                                        as u8,
                                     0,
                                 ),
                             ));
@@ -852,8 +910,7 @@ impl eframe::App for App {
                                 .state
                                 .pos
                                 .iter()
-                                .enumerate()
-                                .map(|(i, v)| [i as f64, *v as f64 * string.conf.boost as f64])
+                                .map(|v| [v.x as f64, v.y as f64 * string.conf.boost as f64])
                                 .collect::<PlotPoints>(),
                         )
                         .name(&format!("string {i}"));
@@ -899,7 +956,7 @@ fn measure(s: &mut PianoString, freq_detector: &FreqDetector) -> (f32, f32) {
     let samples = (0..freq_detector.sample_count)
         .map(|_| {
             s.tick(false);
-            s.listen_mid_unboosted()
+            s.listen_unboosted()
         })
         .collect_vec();
 
@@ -1082,5 +1139,4 @@ fn freq_detector_smoke_test() {
             "detected {detected_freq} expected {freq}"
         );
     }
-    panic!("")
 }
