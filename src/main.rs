@@ -497,11 +497,13 @@ fn main() {
                 let buf_len = data.len();
                 let samples_count = buf_len / playback_config.channels as usize;
                 record_listener_receive_buffer.resize(samples_count, 0.0);
-                // FIXME: the buffer is sometimes of length 189, which might be less than read samples
-                let listened = record_listener
-                    .pop_slice(&mut record_listener_receive_buffer[read_samples..samples_count]);
-                read_samples += listened;
-                if read_samples < record_listener_receive_buffer.len() {
+                if read_samples < samples_count {
+                    let listened = record_listener.pop_slice(
+                        &mut record_listener_receive_buffer[read_samples..samples_count],
+                    );
+                    read_samples += listened;
+                }
+                if read_samples < samples_count {
                     println!(
                         "Input is still filling the buffer: {}",
                         record_listener_receive_buffer.len()
