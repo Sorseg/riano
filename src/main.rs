@@ -1,6 +1,6 @@
 use std::{
     collections::VecDeque,
-    f32::consts::FRAC_PI_2,
+    f32::consts::{FRAC_PI_2, PI},
     path::PathBuf,
     sync::{
         mpsc::{channel, Receiver, Sender},
@@ -22,6 +22,7 @@ use rayon::iter::{ParallelBridge, ParallelIterator};
 use ringbuf::traits::{Consumer, Producer, Split};
 use rustfft::{
     num_complex::{Complex, ComplexFloat},
+    num_traits::ConstZero,
     Fft, FftPlanner,
 };
 use serde::{Deserialize, Serialize};
@@ -33,9 +34,9 @@ const VIS_BUF_SLACK: usize = 44100 * 3;
 const STRINGS_COUNT: usize = 128;
 const LOWEST_KEY: usize = 21;
 const DAMPING_MUTED: f32 = 0.0003;
-const DAMPING_OPEN: f32 = 0.00002;
+const DAMPING_OPEN: f32 = 0.00001;
 // simulation runs this many steps per sample
-const SUB_STEPS: usize = 3;
+const SUB_STEPS: usize = 4;
 
 trait Lerp {
     fn lerp(&self, percent: f32) -> f32;
@@ -67,7 +68,7 @@ struct PianoString {
     state: StringState,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct StringState {
     damping: f32,
     /// key is pressed
@@ -77,9 +78,11 @@ struct StringState {
     /// will be simulated
     is_ringing: bool,
     current_frequency: f32,
-    pos: Vec<f32>,
-    vel: Vec<f32>,
+    /// time domain
+    val: Vec<Complex<f32>>,
     ran_away: bool,
+    fft_fwd: Arc<dyn Fft<f32>>,
+    fft_inv: Arc<dyn Fft<f32>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -99,6 +102,8 @@ struct StringConfig {
 
 impl From<StringConfig> for PianoString {
     fn from(value: StringConfig) -> Self {
+        let fft_fwd = FftPlanner::new().plan_fft_forward(value.size as usize);
+        let fft_inv = FftPlanner::new().plan_fft_inverse(value.size as usize);
         PianoString {
             state: StringState {
                 damping: DAMPING_MUTED,
@@ -107,8 +112,9 @@ impl From<StringConfig> for PianoString {
                 is_ringing: false,
                 current_frequency: 0.0,
                 ran_away: false,
-                pos: vec![0.0; value.size as usize],
-                vel: vec![0.0; value.size as usize],
+                val: vec![Complex::ZERO; value.size as usize],
+                fft_fwd,
+                fft_inv,
             },
             conf: value,
         }
@@ -165,25 +171,25 @@ impl PianoString {
         self.state.ran_away = false;
 
         let vel = vel.clamp(0.0, 1.0);
-        let place_to_pluck = (self.state.pos.len() as f32 * pos) as usize;
-        let pluck_width = (self.state.pos.len() as f32 * width / 2.0) as usize;
-        for i in (place_to_pluck - pluck_width)..=(place_to_pluck + pluck_width) {
-            let distance_from_place_to_pluck = i as f32 - place_to_pluck as f32;
-            self.state.vel[i] =
-                (distance_from_place_to_pluck / pluck_width as f32 * FRAC_PI_2).cos() * vel;
+        for i in 0..self.conf.size / 3 {
+            self.state.val[i as usize].re = vel
+                * 10.0.powf(
+                    -((i as f32 - self.conf.size as f32 / 6.0) / self.conf.size as f32 * 12.0)
+                        .powf(2.0),
+                )
         }
     }
 
     fn listen_left(&self) -> f32 {
-        self.state.pos[(self.state.pos.len() as f32 * 0.2) as usize] * self.conf.boost
+        self.state.val[6].re * self.conf.boost
     }
 
     fn listen_right(&self) -> f32 {
-        self.state.pos[(self.state.pos.len() as f32 * 0.25) as usize] * self.conf.boost
+        self.state.val[5].re * self.conf.boost
     }
 
     fn listen_mid_unboosted(&self) -> f32 {
-        self.state.pos[self.state.pos.len() / 2]
+        self.state.val[5].re
     }
 
     /// needs to be called before plucking
@@ -191,20 +197,19 @@ impl PianoString {
         let new_size = self.conf.size as usize;
         assert!(new_size > 4);
         self.conf.size = new_size as u32;
-        self.state.pos.resize(new_size, 0.0);
-        self.state.vel.resize(new_size, 0.0);
+        self.state.val.resize(new_size, Complex::ZERO);
+        self.state.fft_fwd = FftPlanner::new().plan_fft_forward(new_size);
+        self.state.fft_inv = FftPlanner::new().plan_fft_inverse(new_size);
 
         // make sure the string is still attached horizontaly
         // and not flying away
-        let last = self.state.pos.len() - 1;
-        self.state.pos[last] = 0.0;
-        self.state.pos[last - 1] = 0.0;
-        self.state.vel[last] = 0.0;
-        self.state.vel[last - 1] = 0.0;
+        let last = self.state.val.len() - 1;
+        self.state.val[last] = Complex::ZERO;
+        self.state.val[last - 1] = Complex::ZERO;
     }
 
     fn apply_pressure(&mut self, p: f32) {
-        self.state.vel[8] += p;
+        self.state.val[8].re += p;
     }
 
     fn tick(&mut self, sustain: bool) {
@@ -214,66 +219,41 @@ impl PianoString {
         if !sustain && !self.state.on {
             self.state.is_active = false;
         }
-        for _ in 0..SUB_STEPS {
-            self.advance(sustain);
-        }
+
+        self.advance(sustain);
     }
 
     fn advance(&mut self, sustain: bool) {
-        let mut is_now_active = false;
-        let active_thresh = 0.0001;
+        // let mut is_now_active = false;
+        // let active_thresh = 0.0001;
 
-        // apply velocity
-        for i in 1..(self.state.pos.len() - 1) {
-            self.state.pos[i] += self.state.vel[i] / self.conf.inertia;
+        // switch to freq
+        self.state.fft_fwd.process(&mut self.state.val);
+        for (i, c) in self.state.val.iter_mut().enumerate() {
 
-            if self.state.pos[i].abs() > active_thresh {
-                is_now_active = true;
-            }
-
-            // check for runaway
-            if self.state.pos[i].abs() > 1000.0 {
-                self.state.ran_away = true;
-                println!("Ran away at {:?}", self.conf);
-
-                self.reset();
-                return;
+            // advance the phase
+            if c.abs() > 0.0 {
+                *c *= Complex::from_polar(1.0 - self.state.damping, PI * i as f32 * 0.999);
+                // normalize
+                *c /= self.conf.size as f32
             }
         }
 
-        // apply tension and elasticity
-        for i in 2..(self.state.pos.len() - 2) {
-            let straight_from_left = self.state.pos[i - 1] - self.state.pos[i - 2];
-            let left_force_target = self.state.pos[i - 1] + straight_from_left * 2.0;
+        // switch fo time
+        self.state.fft_inv.process(&mut self.state.val);
 
-            let right_vec = self.state.pos[i + 1] - self.state.pos[i + 2];
-            let right_vec_target = self.state.pos[i + 1] + right_vec * 2.0;
-
-            let elastic_force_target = (left_force_target + right_vec_target) / 2.0;
-
-            let elastic_force = elastic_force_target - self.state.pos[i];
-
-            self.state.vel[i] += self.calc_tens_force(i) + elastic_force * self.conf.elasticity;
-            self.state.vel[i] *= 1.0 - self.state.damping;
-
-            if self.state.vel[i].abs() > active_thresh {
-                is_now_active = true;
-            }
-        }
-
-        self.state.is_ringing = is_now_active || self.state.on || sustain;
+        // self.state.is_ringing = is_now_active || self.state.on || sustain;
     }
 
-    fn calc_tens_force(&self, i: usize) -> f32 {
-        let tension_force_target = (self.state.pos[i - 1] + self.state.pos[i + 1]) / 2.0;
+    // fn calc_tens_force(&self, i: usize) -> f32 {
+    //     let tension_force_target = (self.state.pos[i - 1] + self.state.pos[i + 1]) / 2.0;
 
-        let displacement = tension_force_target - self.state.pos[i];
-        force_for_displacement(displacement * self.conf.tension)
-    }
+    //     let displacement = tension_force_target - self.state.pos[i];
+    //     force_for_displacement(displacement * self.conf.tension)
+    // }
 
     fn reset(&mut self) {
-        self.state.pos.iter_mut().for_each(|p| *p = 0.0);
-        self.state.vel.iter_mut().for_each(|p| *p = 0.0);
+        self.state.val.iter_mut().for_each(|p| *p = Complex::ZERO);
     }
 
     fn ringing_clone(&self) -> Self {
@@ -395,22 +375,22 @@ fn main() {
             for i in 0..50 {
                 strings.push(StringConfig {
                     tension: 10.0,
-                    inertia: 90.0,
+                    inertia: [90.0, 40.0].lerp(i as f32 / 50.0),
                     elasticity: 1.0,
                     size: 128,
                     expected_frequency: 440.0 * 2_f32.powf((i as f32 - 69.0) / 12.0),
-                    boost: 1.0,
+                    boost: 100.0,
                 })
             }
             // middle
             for i in 50..70 {
                 strings.push(StringConfig {
                     tension: 10.0,
-                    inertia: 30.0,
+                    inertia: [30.0, 20.0].lerp((i - 50) as f32 / 20.0),
                     elasticity: 0.4,
                     size: 64,
                     expected_frequency: 440.0 * 2_f32.powf((i as f32 - 69.0) / 12.0),
-                    boost: 1.0,
+                    boost: 100.0,
                 })
             }
             // treble
@@ -421,7 +401,7 @@ fn main() {
                     elasticity: 0.1,
                     size: 32,
                     expected_frequency: 440.0 * 2_f32.powf((i as f32 - 69.0) / 12.0),
-                    boost: 1.0,
+                    boost: 100.0,
                 })
             }
             // super treble
@@ -624,26 +604,26 @@ impl eframe::App for App {
                     Plot::new("sim string").show(ui, |ui| {
                         let pos_iter = s
                             .state
-                            .pos
+                            .val
                             .iter()
                             .copied()
                             .enumerate()
-                            .map(|(i, s)| [i as f64, s as f64]);
+                            .map(|(i, s)| [i as f64, s.re as f64]);
 
                         ui.line(Line::new(pos_iter.clone().collect::<PlotPoints>()));
-                        let vel = s
-                            .state
-                            .vel
-                            .iter()
-                            .copied()
-                            .enumerate()
-                            .zip(&s.state.pos)
-                            .map(|((i, v), p)| [i as f64, (v + *p) as f64])
-                            .collect::<PlotPoints>();
-                        ui.arrows(
-                            Arrows::new(pos_iter.clone().collect::<PlotPoints>(), vel)
-                                .tip_length(10.0),
-                        );
+                        // let vel = s
+                        //     .state
+                        //     .vel
+                        //     .iter()
+                        //     .copied()
+                        //     .enumerate()
+                        //     .zip(&s.state.pos)
+                        //     .map(|((i, v), p)| [i as f64, (v + *p) as f64])
+                        //     .collect::<PlotPoints>();
+                        // ui.arrows(
+                        //     Arrows::new(pos_iter.clone().collect::<PlotPoints>(), vel)
+                        //         .tip_length(10.0),
+                        // );
                     });
                 });
             if !open {
@@ -701,7 +681,7 @@ impl eframe::App for App {
                             ui.label(RichText::new(format!("{i}")).background_color(
                                 Color32::from_rgb(
                                     if s.state.ran_away { 255 } else { 0 },
-                                    (s.state.pos.iter().sum::<f32>().abs() * 255.0) as u8,
+                                    (s.state.val.iter().sum::<Complex<f32>>().abs() * 255.0) as u8,
                                     0,
                                 ),
                             ));
@@ -852,10 +832,10 @@ impl eframe::App for App {
                         let line = Line::new(
                             string
                                 .state
-                                .pos
+                                .val
                                 .iter()
                                 .enumerate()
-                                .map(|(i, v)| [i as f64, *v as f64 * string.conf.boost as f64])
+                                .map(|(i, v)| [i as f64, v.re as f64 * string.conf.boost as f64])
                                 .collect::<PlotPoints>(),
                         )
                         .name(&format!("string {i}"));
@@ -993,7 +973,7 @@ fn tune(freq_detector: &FreqDetector, s: &mut PianoString, target_freq: f32) -> 
         (current_freq, level) = measure(s, freq_detector);
 
         let error = target_freq - current_freq;
-        if error.abs() < target_freq * 0.003 {
+        if error.abs() < target_freq * 0.001 {
             println!("tuned");
             break;
         }
@@ -1084,5 +1064,22 @@ fn freq_detector_smoke_test() {
             "detected {detected_freq} expected {freq}"
         );
     }
-    panic!("")
+}
+
+#[test]
+fn string_adv_smoke() {
+    let mut s = PianoString::from(StringConfig {
+        boost: 1.0,
+        size: 128,
+        tension: 1.0,
+        inertia: 1.0,
+        elasticity: 1.0,
+        expected_frequency: 200.0,
+    });
+    s.pluck(1.0, 0.2, 0.2);
+    for _ in 0..10 {
+        s.tick(false);
+        println!("{:?}", s.state.val)
+    }
+    assert_eq!(vec![Complex::ZERO], s.state.val);
 }
